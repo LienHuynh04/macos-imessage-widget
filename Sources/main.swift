@@ -525,7 +525,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 //  app.run() bắt đầu vòng lặp sự kiện (event loop) của macOS.
 // ============================================================
 
-let app = NSApplication.shared
-let delegate = AppDelegate() // biến top-level: sống suốt vòng đời process
+// QUY TẮC SWIFT cần nhớ: một khai báo không được "lộ" hơn kiểu của nó.
+// AppDelegate là `private` → 2 biến top-level dưới đây cũng phải `private`
+// (bỏ chữ private là lỗi biên dịch ngay, như bạn vừa gặp).
+private let app = NSApplication.shared
+private let delegate = AppDelegate() // biến top-level: sống suốt vòng đời process
 app.delegate = delegate
 app.run()
