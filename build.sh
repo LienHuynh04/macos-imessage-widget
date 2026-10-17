@@ -30,3 +30,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 EOF
 
 echo "Built at $APP"
+
+# Relaunch the app so the fresh build runs immediately
+pkill -x "$APP_NAME" 2>/dev/null || true
+echo "Launching $APP_NAME..."
+open "$APP"

@@ -31,9 +31,10 @@ What it does NOT do (yet):
 2. Run:
    `chmod +x build.sh`
    `./build.sh`
-3. The app is created at `dist/Messenger Mini.app`. Double-click it in Finder.
-   If macOS warns because it is an unsigned local app, use Control-click > Open
-   and confirm, only if you built it yourself from this source.
+3. The app is created at `dist/Messenger Mini.app` and launched automatically.
+   (If macOS warns because it is an unsigned local app, use Control-click >
+   Open on `dist/Messenger Mini.app` in Finder and confirm, only if you built
+   it yourself from this source.)
 4. On first launch the app creates `~/.messenger-mini/chats.json` with sample
    conversations. Edit that file to add your own chats — the panel reloads
    automatically when you save (if auto-reload ever stops, use "..." > "Tải lại
