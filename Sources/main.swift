@@ -251,6 +251,13 @@ final class AvatarView: NSView {
 
     override func mouseDown(with event: NSEvent) { onClick?() }
 
+    // Route clicks anywhere inside the avatar (label, image, badge subviews)
+    // to this view, otherwise subviews swallow the click and onClick never fires.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard super.hitTest(point) != nil else { return nil }
+        return self
+    }
+
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
     }
@@ -907,6 +914,12 @@ final class PreviewBubble: NSView {
     }
 
     override func mouseDown(with event: NSEvent) { onClick?() }
+
+    // Same as AvatarView: make the whole bubble (including its text label) clickable.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard super.hitTest(point) != nil else { return nil }
+        return self
+    }
 
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
