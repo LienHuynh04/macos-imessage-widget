@@ -465,7 +465,7 @@ private final class HeadsPanel: NSPanel {
         level = .floating
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate = false
-        container.frame = bounds
+        container.frame = NSRect(x: 0, y: 0, width: Self.width, height: 120)
         container.autoresizingMask = [.width, .height]
         contentView = container
         restoreOrigin()
@@ -485,7 +485,7 @@ private final class HeadsPanel: NSPanel {
         f.size = NSSize(width: Self.width, height: h)
         f.origin.y = oldMaxY - h
         setFrame(f, display: true)
-        container.frame = bounds
+        container.frame = NSRect(origin: .zero, size: contentRect(forFrameRect: f).size)
 
         var y = h - gap - d
         for head in heads {
