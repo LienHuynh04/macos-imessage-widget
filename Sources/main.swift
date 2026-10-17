@@ -57,6 +57,30 @@ private enum Mini {
 
     /// Ngưỡng phân biệt "kéo" và "bấm": di chuyển quá 4pt mới tính là kéo.
     static let dragThreshold: CGFloat = 4
+
+    /// Khóa lưu danh sách đoạn chat đã ghim (UserDefaults, dạng JSON).
+    static let headsKey = "messengerBubbleDIY.chatHeads"
+    static let headsOriginKey = "messengerBubbleDIY.headsOrigin"
+
+    /// Deep link mở THẲNG 1 đoạn chat, bỏ qua inbox chung.
+    /// Ví dụ: https://www.messenger.com/t/1234567890123456
+    /// Đây là cách "chỉ mở đúng message": mỗi head giữ 1 thread ID.
+    static func threadURL(_ id: String) -> URL {
+        URL(string: "https://www.messenger.com/t/\(id)")!
+    }
+
+    /// Tách thread ID từ link messenger (chứa /t/123...) hoặc chuỗi số thuần.
+    /// Trả về nil nếu không nhận ra → báo cho user nhập lại.
+    static func extractThreadID(from text: String) -> String? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let r = t.range(of: "/t/(\\d+)", options: .regularExpression) {
+            return String(t[r].dropFirst(3)) // bỏ "/t/", giữ dãy số
+        }
+        if !t.isEmpty && t.allSatisfy(\.isNumber) && t.count >= 5 {
+            return t
+        }
+        return nil
+    }
 }
 
 // ============================================================
@@ -94,6 +118,18 @@ private enum MiniJS {
           report();
         }
       }, 200);
+    })();
+    """
+
+    /// JS ẩn cột danh sách chat bên trái → chỉ còn đúng khung tin nhắn.
+    /// Được chạy sau khi trang load xong (xem AppDelegate.webView(didFinish:)),
+    /// và CHỈ khi URL là 1 thread cụ thể (/t/<id>) để inbox chung vẫn nguyên.
+    /// LƯU Ý TRUNG THỰC: selector dựa vào DOM hiện tại của Meta. Nếu một ngày
+    /// không còn tác dụng, inspect lại trang và sửa selector này.
+    static let hideSidebar = """
+    (function(){
+      var nav = document.querySelector('div[role="navigation"]');
+      if (nav) { nav.style.display = 'none'; }
     })();
     """
 }
@@ -149,6 +185,7 @@ private final class BubbleView: NSView {
     /// hơn delegate protocol khi chỉ có vài sự kiện.
     var onTap: (() -> Void)?
     var onToggleChat: (() -> Void)?
+    var onOpenInbox: (() -> Void)?
     var onToggleAlwaysOnTop: (() -> Void)?
     var onCycleColor: (() -> Void)?
     var onLogout: (() -> Void)?
@@ -263,6 +300,7 @@ private final class BubbleView: NSView {
     // ---- Menu chuột phải ----
 
     @objc private func menuToggleChat(_ sender: NSMenuItem) { onToggleChat?() }
+    @objc private func menuOpenInbox(_ sender: NSMenuItem) { onOpenInbox?() }
     @objc private func menuToggleAlwaysOnTop(_ sender: NSMenuItem) { onToggleAlwaysOnTop?() }
     @objc private func menuCycleColor(_ sender: NSMenuItem) { onCycleColor?() }
     @objc private func menuLogout(_ sender: NSMenuItem) { onLogout?() }
@@ -276,6 +314,7 @@ private final class BubbleView: NSView {
             return i
         }
         menu.addItem(item("Mở/đóng cửa sổ chat", #selector(menuToggleChat)))
+        menu.addItem(item("Về inbox chung", #selector(menuOpenInbox)))
         // Dấu ✓ cho biết cửa sổ chat đang "ghim" luôn-nổi hay không
         let pinItem = item("Ghim cửa sổ chat luôn nằm trên", #selector(menuToggleAlwaysOnTop))
         pinItem.state = isAlwaysOnTop() ? .on : .off
@@ -339,6 +378,152 @@ private final class BubbleWindow: NSPanel {
 }
 
 // ============================================================
+//  PHẦN 5B — CHAT HEADS: dải avatar nổi mở thẳng từng đoạn chat
+//  ------------------------------------------------------------
+//  Đúng ý bạn hỏi: một dải tròn xếp dọc ở mép màn hình,
+//  mỗi "head" = 1 đoạn chat đã ghim. Bấm head → cửa sổ chat mở THẲNG
+//  thread đó qua deep link /t/<id>, không đi qua inbox chung.
+//  Thêm head: bấm nút "+" → dán link đoạn chat (mở đoạn chat trên trình
+//  duyệt, copy URL có dạng .../t/123456...) + đặt tên hiển thị.
+// ============================================================
+
+/// 1 đoạn chat đã ghim: tên hiển thị + thread ID. Lưu JSON trong UserDefaults.
+private struct ChatHead: Codable {
+    var name: String
+    var threadID: String
+}
+
+/// 1 head tròn: vẽ chữ cái đầu của tên, màu theo hash tên (nhận mặt bằng màu).
+/// BÀI TẬP nâng cấp: thay chữ cái bằng ảnh avatar (NSImage từ URL/file local).
+private final class HeadView: NSView {
+    let head: ChatHead
+    var onSelect: (() -> Void)?
+    var onRemove: (() -> Void)?
+
+    init(head: ChatHead, diameter: CGFloat) {
+        self.head = head
+        super.init(frame: NSRect(x: 0, y: 0, width: diameter, height: diameter))
+    }
+    required init?(coder: NSCoder) { nil }
+
+    private var circleColor: NSColor {
+        let palette: [NSColor] = [
+            .systemBlue, .systemGreen, .systemOrange, .systemPurple,
+            .systemPink, .systemTeal, .systemIndigo, .systemBrown,
+        ]
+        return palette[abs(head.name.hashValue) % palette.count]
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 2, dy: 2))
+        circleColor.setFill()
+        circle.fill()
+        let initial = String(head.name.prefix(1)).uppercased()
+        let font = NSFont.boldSystemFont(ofSize: bounds.width * 0.42)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white
+        ]
+        let ts = (initial as NSString).size(withAttributes: attrs)
+        (initial as NSString).draw(at: NSPoint(x: (bounds.width - ts.width) / 2,
+                                               y: (bounds.height - ts.height) / 2 + 1),
+                                   withAttributes: attrs)
+    }
+
+    override func mouseUp(with event: NSEvent) { onSelect?() }
+
+    @objc private func menuRemove(_ sender: NSMenuItem) { onRemove?() }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+        let i = NSMenuItem(title: "Xóa \"\(head.name)\" khỏi danh sách",
+                           action: #selector(menuRemove), keyEquivalent: "")
+        i.target = self
+        menu.addItem(i)
+        menu.popUp(positioning: nil,
+                   at: convert(event.locationInWindow, from: nil),
+                   in: self)
+    }
+}
+
+/// Panel dọc chứa các head + nút "+". Nổi mọi Space, không viền, không Dock.
+private final class HeadsPanel: NSPanel {
+    static let width: CGFloat = 60
+    static let headDiameter: CGFloat = 46
+
+    private let container = NSView()
+    var onAdd: (() -> Void)?
+
+    init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 120),
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered,
+                   defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        container.frame = bounds
+        container.autoresizingMask = [.width, .height]
+        contentView = container
+        restoreOrigin()
+    }
+
+    /// Dựng lại toàn bộ head (gọi mỗi khi thêm/xóa). Giữ mép trên cố định
+    /// để panel không "nhảy" khi danh sách dài ra.
+    func rebuild(heads: [ChatHead],
+                 onSelect: @escaping (ChatHead) -> Void,
+                 onRemove: @escaping (ChatHead) -> Void) {
+        container.subviews.forEach { $0.removeFromSuperview() }
+        let d = Self.headDiameter
+        let gap: CGFloat = 8
+        let h = gap + CGFloat(heads.count + 1) * (d + gap) // +1 cho nút "+"
+        var f = frame
+        let oldMaxY = f.maxY
+        f.size = NSSize(width: Self.width, height: h)
+        f.origin.y = oldMaxY - h
+        setFrame(f, display: true)
+        container.frame = bounds
+
+        var y = h - gap - d
+        for head in heads {
+            let v = HeadView(head: head, diameter: d)
+            v.frame = NSRect(x: (Self.width - d) / 2, y: y, width: d, height: d)
+            v.onSelect = { onSelect(head) }
+            v.onRemove = { onRemove(head) }
+            container.addSubview(v)
+            y -= (d + gap)
+        }
+        // Nút "+" thêm đoạn chat mới
+        let plus = NSButton(frame: NSRect(x: (Self.width - d) / 2, y: y,
+                                          width: d, height: d))
+        plus.bezelStyle = .circular
+        plus.title = "+"
+        plus.font = NSFont.systemFont(ofSize: 24)
+        plus.target = self
+        plus.action = #selector(didTapAdd)
+        container.addSubview(plus)
+    }
+
+    @objc private func didTapAdd() { onAdd?() }
+
+    private func restoreOrigin() {
+        var origin: NSPoint?
+        if let s = UserDefaults.standard.string(forKey: Mini.headsOriginKey) {
+            let parts = s.split(separator: ",").compactMap { Double($0) }
+            if parts.count == 2 { origin = NSPoint(x: parts[0], y: parts[1]) }
+        }
+        if origin == nil, let vf = NSScreen.main?.visibleFrame {
+            origin = NSPoint(x: vf.maxX - Self.width - 8,
+                             y: vf.midY - frame.height / 2)
+        }
+        setFrameOrigin(origin ?? .zero)
+    }
+}
+
+// ============================================================
 //  PHẦN 6 — CỬA SỔ CHAT: WKWebView bọc messenger.com
 //  ------------------------------------------------------------
 //  • websiteDataStore = .default() → cookie PERSISTENT của hệ thống:
@@ -396,10 +581,12 @@ private final class ChatWindow: NSWindow {
 //    Quên "weak" → AppDelegate và BubbleView giữ nhau → rò rỉ.
 // ============================================================
 
-private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
 
     private var bubble: BubbleWindow!
     private var chat: ChatWindow!
+    private var headsPanel: HeadsPanel!
+    private var heads: [ChatHead] = []
     private let scriptHandler = UnreadScriptHandler()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -411,6 +598,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         bubble = BubbleWindow()
         chat = ChatWindow(scriptHandler: scriptHandler)
         chat.delegate = self
+        chat.webView.navigationDelegate = self
         positionChatDefaultIfNeeded()
 
         // Khôi phục màu bong bóng đã chọn lần trước
@@ -422,12 +610,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         bv.isAlwaysOnTop = { [weak self] in self?.chat.level == .floating }
         bv.onTap = { [weak self] in self?.toggleChat() }
         bv.onToggleChat = { [weak self] in self?.toggleChat() }
+        bv.onOpenInbox = { [weak self] in self?.openInbox() }
         bv.onToggleAlwaysOnTop = { [weak self] in self?.toggleAlwaysOnTop() }
         bv.onCycleColor = { [weak self] in self?.cycleBubbleColor() }
         bv.onLogout = { [weak self] in self?.logout() }
         bv.onQuit = { NSApp.terminate(nil) }
 
         bubble.orderFrontRegardless()
+
+        // Dải chat heads (PHẦN 5B)
+        loadHeads()
+        headsPanel = HeadsPanel()
+        headsPanel.onAdd = { [weak self] in self?.addChat() }
+        rebuildHeads()
+        headsPanel.orderFrontRegardless()
     }
 
     // ---- Badge tin chưa đọc (được gọi từ PHẦN 3) ----
@@ -462,6 +658,98 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let next = (current + 1) % Mini.bubbleColors.count
         UserDefaults.standard.set(next, forKey: Mini.colorIndexKey)
         bubble.bubbleView.bubbleColor = Mini.bubbleColors[next]
+    }
+
+    // ---- Chat heads (PHẦN 5B): mở thẳng từng đoạn chat ----
+
+    private func loadHeads() {
+        guard let data = UserDefaults.standard.data(forKey: Mini.headsKey),
+              let decoded = try? JSONDecoder().decode([ChatHead].self, from: data)
+        else { heads = []; return }
+        heads = decoded
+    }
+
+    private func saveHeads() {
+        if let data = try? JSONEncoder().encode(heads) {
+            UserDefaults.standard.set(data, forKey: Mini.headsKey)
+        }
+    }
+
+    private func rebuildHeads() {
+        headsPanel.rebuild(heads: heads,
+                           onSelect: { [weak self] head in self?.openThread(head) },
+                           onRemove: { [weak self] head in self?.removeHead(head) })
+    }
+
+    /// Mở THẲNG 1 đoạn chat bằng deep link /t/<id> — không qua inbox chung.
+    private func openThread(_ head: ChatHead) {
+        chat.webView.load(URLRequest(url: Mini.threadURL(head.threadID)))
+        chat.title = "Messenger — \(head.name)"
+        showChatWindow()
+    }
+
+    /// Về lại inbox chung (danh sách tất cả đoạn chat).
+    private func openInbox() {
+        chat.webView.load(URLRequest(url: Mini.chatURL))
+        chat.title = "Messenger"
+        showChatWindow()
+    }
+
+    private func showChatWindow() {
+        if !chat.isVisible {
+            chat.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    private func removeHead(_ head: ChatHead) {
+        heads.removeAll { $0.threadID == head.threadID }
+        saveHeads()
+        rebuildHeads()
+    }
+
+    /// Dialog thêm đoạn chat: dán link (hoặc thread ID) + đặt tên hiển thị.
+    /// Cách lấy link: mở đoạn chat trên trình duyệt → copy URL trên thanh
+    /// địa chỉ (có dạng .../t/123456...) → dán vào ô đầu tiên.
+    private func addChat() {
+        let alert = NSAlert()
+        alert.messageText = "Ghim đoạn chat"
+        alert.informativeText = "Dán link đoạn chat (URL chứa /t/ + dãy số) hoặc dãy số thread ID."
+        let linkField = NSTextField(frame: NSRect(x: 0, y: 28, width: 300, height: 24))
+        linkField.placeholderString = "Link hoặc thread ID, ví dụ …/t/123456789"
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        nameField.placeholderString = "Tên hiển thị, ví dụ: Sếp Minh"
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 56))
+        box.addSubview(linkField)
+        box.addSubview(nameField)
+        alert.accessoryView = box
+        alert.addButton(withTitle: "Thêm")
+        alert.addButton(withTitle: "Hủy")
+        alert.window.initialFirstResponder = linkField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        guard let id = Mini.extractThreadID(from: linkField.stringValue) else {
+            let err = NSAlert()
+            err.messageText = "Không nhận ra link/ID"
+            err.informativeText = "Hãy dán URL đoạn chat (chứa /t/ + dãy số) hoặc dãy số ID."
+            err.runModal()
+            return
+        }
+        guard !heads.contains(where: { $0.threadID == id }) else { return } // đã ghim rồi
+        let rawName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        heads.append(ChatHead(name: rawName.isEmpty ? "Chat \(heads.count + 1)" : rawName,
+                              threadID: id))
+        saveHeads()
+        rebuildHeads()
+    }
+
+    // ---- WKNavigationDelegate: ẩn cột chat-list khi đang xem thread ----
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // Chỉ ẩn sidebar khi URL là 1 thread cụ thể (/t/<id>);
+        // inbox chung (openInbox) giữ nguyên để còn duyệt danh sách.
+        guard webView.url?.path.contains("/t/") == true else { return }
+        webView.evaluateJavaScript(MiniJS.hideSidebar, completionHandler: nil)
     }
 
     /// Lần đầu chưa có frame lưu: đặt cửa sổ chat bên trái bong bóng.

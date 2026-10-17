@@ -17,6 +17,20 @@ tiếng Việt từng phần để bạn đọc-hiểu-tự sửa.
 - 🔒 Tự đăng nhập Facebook 1 lần trong app; macOS nhớ cookie, lần sau khỏi nhập.
 - 🚪 Chuột phải → đăng xuất / thoát. Nút đỏ chỉ *ẩn* cửa sổ chat, không tắt app.
 - Không icon Dock (app phụ), thoát bằng menu chuột phải → *Thoát* hoặc `Cmd+Q`.
+- 🧑‍🤝‍🧑 **Chat heads**: dải avatar tròn xếp dọc ở mép màn hình — mỗi head mở
+  **thẳng** 1 đoạn chat (deep link `/t/<id>`), cửa sổ chat tự ẩn cột danh sách
+  để chỉ còn khung tin nhắn. Bấm **+** để ghim đoạn chat mới (dán link `/t/...`
+  copy từ trình duyệt + đặt tên), chuột phải vào head để xóa.
+
+## Cách ghim 1 đoạn chat (chat heads)
+
+1. Mở trình duyệt, vào `messenger.com`, bấm vào đoạn chat muốn ghim.
+2. Copy URL trên thanh địa chỉ — nó có dạng `.../t/123456789...`.
+3. Trong app, bấm nút **+** ở cuối dải heads → dán link → đặt tên → *Thêm*.
+4. Từ nay bấm vào head là mở thẳng đoạn chat đó, không qua inbox chung.
+
+Muốn quay lại danh sách tất cả đoạn chat: chuột phải vào bong bóng xanh →
+**Về inbox chung**.
 
 ## Chạy thử (trên Mac)
 
@@ -59,6 +73,12 @@ phát triển không xác định?" → vào *System Settings → Privacy & Secu
    theo thời gian (gợi ý: `Timer` + `needsDisplay = true`).
 6. **Đọc thêm từ trang web**: viết thêm JS trong `MiniJS` để đọc tên người
    đang nhắn (gợi ý: `document.querySelector(...)`), gửi về Swift như `unread`.
+7. **Avatar thật cho heads**: thay chữ cái trong `HeadView.draw` bằng
+   `NSImage` tải từ URL (gợi ý: `NSImage(contentsOf:)` + cache vào
+   `~/Library/Caches`).
+8. **Badge riêng từng head**: hiện tại badge tổng nằm trên bong bóng xanh.
+   Thử đọc số chưa đọc *từng thread* (gợi ý khó: phải mở từng thread hoặc
+   đọc DOM của inbox).
 
 ## Giới hạn cần biết (nói thật)
 
