@@ -24,6 +24,14 @@ tiếng Việt từng phần để bạn đọc-hiểu-tự sửa.
 
 ## Cách ghim 1 đoạn chat (chat heads)
 
+**Cách 1 — chọn từ inbox (khuyên dùng, khỏi copy link):**
+
+1. Chuột phải vào bong bóng xanh → **Ghim đoạn chat từ inbox…**
+2. App tự mở inbox, đợi vài giây rồi hiện danh sách đoạn chat quét được
+   → chọn 1 cái → *Ghim*. Xong!
+
+**Cách 2 — dán link thủ công:**
+
 1. Mở trình duyệt, vào `messenger.com`, bấm vào đoạn chat muốn ghim.
 2. Copy URL trên thanh địa chỉ — nó có dạng `.../t/123456789...`.
 3. Trong app, bấm nút **+** ở cuối dải heads → dán link → đặt tên → *Thêm*.
@@ -31,6 +39,10 @@ tiếng Việt từng phần để bạn đọc-hiểu-tự sửa.
 
 Muốn quay lại danh sách tất cả đoạn chat: chuột phải vào bong bóng xanh →
 **Về inbox chung**.
+
+> Lưu ý: cách 1 đọc danh sách bằng JavaScript quét DOM của trang Messenger.
+> Nếu một ngày Meta đổi cấu trúc trang và quét không ra gì, app sẽ báo —
+> lúc đó dùng cách 2, hoặc mở `MiniJS.threadList` sửa selector theo DOM mới.
 
 ## Chạy thử (trên Mac)
 

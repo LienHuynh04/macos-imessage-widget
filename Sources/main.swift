@@ -132,6 +132,34 @@ private enum MiniJS {
       if (nav) { nav.style.display = 'none'; }
     })();
     """
+
+    /// JS quét danh sách đoạn chat trong inbox: tìm mọi link chứa /t/<id>,
+    /// lấy tên từ aria-label (fallback: dòng text đầu tiên), gửi JSON về
+    /// Swift qua message handler "threads": [{id, name}, ...].
+    /// LƯU Ý TRUNG THỰC: dựa vào DOM hiện tại của Meta. Nếu một ngày quét
+    /// không ra gì, inspect lại trang và sửa selector 'a[href*="/t/"]'.
+    static let threadList = """
+    (function(){
+      var out = [], seen = {};
+      try {
+        document.querySelectorAll('a[href*="/t/"]').forEach(function(a){
+          var href = a.getAttribute('href') || '';
+          var m = href.match(/\\/t\\/(\\d+)/);
+          if (!m) return;
+          var id = m[1];
+          if (seen[id]) return;
+          seen[id] = 1;
+          var name = a.getAttribute('aria-label') || '';
+          if (!name) {
+            var t = (a.innerText || '').split('\\n')[0].trim();
+            name = t.substring(0, 40);
+          }
+          if (name) out.push({id: id, name: name});
+        });
+        window.webkit.messageHandlers.threads.postMessage(JSON.stringify(out));
+      } catch (e) { /* bo qua */ }
+    })();
+    """
 }
 
 // ============================================================
@@ -161,6 +189,25 @@ private final class UnreadScriptHandler: NSObject, WKScriptMessageHandler {
     }
 }
 
+/// 1 đoạn chat quét được từ inbox: id + tên hiển thị.
+private struct ScrapedThread: Codable {
+    var id: String
+    var name: String
+}
+
+/// Cầu nối JS → Swift cho kết quả quét inbox (handler "threads").
+/// Cũng dùng mẫu weak wrapper như UnreadScriptHandler để tránh retain cycle.
+private final class ThreadsScriptHandler: NSObject, WKScriptMessageHandler {
+    weak var target: AppDelegate?
+
+    func userContentController(_ ucc: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "threads",
+              let json = message.body as? String else { return }
+        target?.didReceiveThreads(json)
+    }
+}
+
 // ============================================================
 //  PHẦN 4 — BONG BÓNG: vẽ + kéo/thả + menu chuột phải
 //  ------------------------------------------------------------
@@ -186,6 +233,7 @@ private final class BubbleView: NSView {
     var onTap: (() -> Void)?
     var onToggleChat: (() -> Void)?
     var onOpenInbox: (() -> Void)?
+    var onScanInbox: (() -> Void)?
     var onToggleAlwaysOnTop: (() -> Void)?
     var onCycleColor: (() -> Void)?
     var onLogout: (() -> Void)?
@@ -301,6 +349,7 @@ private final class BubbleView: NSView {
 
     @objc private func menuToggleChat(_ sender: NSMenuItem) { onToggleChat?() }
     @objc private func menuOpenInbox(_ sender: NSMenuItem) { onOpenInbox?() }
+    @objc private func menuScanInbox(_ sender: NSMenuItem) { onScanInbox?() }
     @objc private func menuToggleAlwaysOnTop(_ sender: NSMenuItem) { onToggleAlwaysOnTop?() }
     @objc private func menuCycleColor(_ sender: NSMenuItem) { onCycleColor?() }
     @objc private func menuLogout(_ sender: NSMenuItem) { onLogout?() }
@@ -315,6 +364,7 @@ private final class BubbleView: NSView {
         }
         menu.addItem(item("Mở/đóng cửa sổ chat", #selector(menuToggleChat)))
         menu.addItem(item("Về inbox chung", #selector(menuOpenInbox)))
+        menu.addItem(item("Ghim đoạn chat từ inbox…", #selector(menuScanInbox)))
         // Dấu ✓ cho biết cửa sổ chat đang "ghim" luôn-nổi hay không
         let pinItem = item("Ghim cửa sổ chat luôn nằm trên", #selector(menuToggleAlwaysOnTop))
         pinItem.state = isAlwaysOnTop() ? .on : .off
@@ -537,14 +587,15 @@ private final class ChatWindow: NSWindow {
 
     let webView: WKWebView
 
-    init(scriptHandler: UnreadScriptHandler) {
+    init(unreadHandler: UnreadScriptHandler, threadsHandler: ThreadsScriptHandler) {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         let ucc = WKUserContentController()
         ucc.addUserScript(WKUserScript(source: MiniJS.unreadCounter,
                                       injectionTime: .atDocumentEnd,
                                       forMainFrameOnly: true))
-        ucc.add(scriptHandler, name: "unread")
+        ucc.add(unreadHandler, name: "unread")
+        ucc.add(threadsHandler, name: "threads")
         config.userContentController = ucc
 
         webView = WKWebView(frame: .zero, configuration: config)
@@ -588,15 +639,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var headsPanel: HeadsPanel!
     private var heads: [ChatHead] = []
     private let scriptHandler = UnreadScriptHandler()
+    private let threadsScriptHandler = ThreadsScriptHandler()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // .accessory = app "phụ": KHÔNG hiện icon trên Dock
         NSApp.setActivationPolicy(.accessory)
         buildMenu()
         scriptHandler.target = self
+        threadsScriptHandler.target = self
 
         bubble = BubbleWindow()
-        chat = ChatWindow(scriptHandler: scriptHandler)
+        chat = ChatWindow(unreadHandler: scriptHandler,
+                          threadsHandler: threadsScriptHandler)
         chat.delegate = self
         chat.webView.navigationDelegate = self
         positionChatDefaultIfNeeded()
@@ -611,6 +665,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         bv.onTap = { [weak self] in self?.toggleChat() }
         bv.onToggleChat = { [weak self] in self?.toggleChat() }
         bv.onOpenInbox = { [weak self] in self?.openInbox() }
+        bv.onScanInbox = { [weak self] in self?.scanInbox() }
         bv.onToggleAlwaysOnTop = { [weak self] in self?.toggleAlwaysOnTop() }
         bv.onCycleColor = { [weak self] in self?.cycleBubbleColor() }
         bv.onLogout = { [weak self] in self?.logout() }
@@ -739,6 +794,70 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let rawName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         heads.append(ChatHead(name: rawName.isEmpty ? "Chat \(heads.count + 1)" : rawName,
                               threadID: id))
+        saveHeads()
+        rebuildHeads()
+    }
+
+    // ---- Quét inbox: lấy danh sách đoạn chat từ chính trang web ----
+
+    /// Mở inbox, đợi trang load rồi chạy JS quét danh sách thread.
+    /// Con số 4 giây là heuristic (đoán thời gian load) — nếu mạng chậm,
+    /// tăng lên. BÀI HỌC: polling/delay là cách đơn giản nhất để đợi SPA;
+    /// cách "sạch" hơn là observe DOM, nhưng phức tạp hơn nhiều.
+    private func scanInbox() {
+        chat.webView.load(URLRequest(url: Mini.chatURL))
+        chat.title = "Messenger"
+        showChatWindow()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.chat.webView.evaluateJavaScript(MiniJS.threadList,
+                                                  completionHandler: nil)
+        }
+    }
+
+    /// Nhận JSON [{id, name}] từ JS (được gọi trên background thread).
+    func didReceiveThreads(_ json: String) {
+        let list: [ScrapedThread]
+        if let data = json.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([ScrapedThread].self, from: data),
+           !decoded.isEmpty {
+            list = decoded
+        } else {
+            list = []
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.handleScannedThreads(list)
+        }
+    }
+
+    private func handleScannedThreads(_ list: [ScrapedThread]) {
+        guard !list.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Không quét được đoạn chat nào"
+            alert.informativeText = "Hãy chắc chắn cửa sổ chat đang mở inbox (danh sách đoạn chat), rồi thử lại. Nếu vẫn không được, Meta có thể đã đổi cấu trúc trang — dùng cách dán link thủ công."
+            alert.runModal()
+            return
+        }
+        // Lọc bớt những thread đã ghim rồi cho gọn
+        let fresh = list.filter { t in !heads.contains(where: { $0.threadID == t.id }) }
+        guard !fresh.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Tất cả đoạn chat tìm thấy đều đã được ghim"
+            alert.runModal()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Chọn đoạn chat để ghim"
+        alert.informativeText = "Danh sách lấy trực tiếp từ inbox của bạn."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        popup.addItems(withTitles: fresh.map { $0.name })
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Ghim")
+        alert.addButton(withTitle: "Hủy")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let idx = popup.indexOfSelectedItem
+        guard fresh.indices.contains(idx) else { return }
+        let t = fresh[idx]
+        heads.append(ChatHead(name: t.name, threadID: t.id))
         saveHeads()
         rebuildHeads()
     }
