@@ -74,7 +74,9 @@ Gatekeeper or change system security settings.
 - `preview`: small subtitle under the name in the chat window header. If `unread`
   is greater than 0, it is also shown in the popup bubble next to the avatar.
 - `messages`: static messages shown in the chat window. `"from"` is `"them"`
-  (grey bubble, left) or `"me"` (blue bubble, right).
+  (grey bubble, left) or `"me"` (blue bubble, right). Optional `"seen": true`
+  shows blue seen checkmarks under your bubble; optional `"reaction": "😃"`
+  shows an emoji reaction under the bubble.
 
 ## Quit
 The app has no Dock icon. Use "..." > "Thoát" in the panel, or from Terminal:

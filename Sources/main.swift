@@ -16,6 +16,8 @@ import Cocoa
 struct ChatMessage: Codable {
     var from: String          // "me" | "them"
     var text: String
+    var seen: Bool = false    // "me" only: show blue seen checkmarks under the bubble
+    var reaction: String?     // optional emoji reaction shown under the bubble
 }
 
 struct ChatConfig: Codable {
@@ -80,7 +82,7 @@ final class ConfigStore {
                     ChatMessage(from: "them", text: "Messenger nay có tính năng mới nhỉ"),
                     ChatMessage(from: "them", text: "Tiện thật đó"),
                     ChatMessage(from: "me", text: "Quá ngon luôn ấy chứ"),
-                    ChatMessage(from: "me", text: "Hiện tại xài thấy khá là oke nha"),
+                    ChatMessage(from: "me", text: "Hiện tại xài thấy khá là oke nha", seen: true, reaction: "😃"),
                 ]
             ),
             ChatConfig(
@@ -571,6 +573,46 @@ final class BubbleView: NSView {
     }
 }
 
+// MARK: - Message unit: bubble + optional reaction + seen checkmarks
+
+final class MessageUnitView: NSView {
+    init(message: ChatMessage) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let mine = message.from == "me"
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = mine ? .trailing : .leading
+        stack.spacing = 2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+
+        stack.addArrangedSubview(BubbleView(text: message.text, mine: mine))
+
+        if let reaction = message.reaction, !reaction.isEmpty {
+            let r = NSTextField(labelWithString: reaction)
+            r.font = NSFont.systemFont(ofSize: 15)
+            stack.addArrangedSubview(r)
+        }
+
+        if mine && message.seen {
+            let s = NSTextField(labelWithString: "✓✓")
+            s.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            s.textColor = .systemBlue
+            stack.addArrangedSubview(s)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 // MARK: - Floating chat window (one per conversation)
 
 final class ChatWindowController: NSObject {
@@ -758,17 +800,17 @@ final class ChatWindowController: NSObject {
             row.translatesAutoresizingMaskIntoConstraints = false
             row.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true
             let mine = msg.from == "me"
-            let bubble = BubbleView(text: msg.text, mine: mine)
-            row.addSubview(bubble)
+            let unit = MessageUnitView(message: msg)
+            row.addSubview(unit)
             NSLayoutConstraint.activate([
-                bubble.topAnchor.constraint(equalTo: row.topAnchor, constant: 3),
-                bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -3),
-                bubble.widthAnchor.constraint(lessThanOrEqualToConstant: 270),
+                unit.topAnchor.constraint(equalTo: row.topAnchor, constant: 3),
+                unit.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -3),
+                unit.widthAnchor.constraint(lessThanOrEqualToConstant: 270),
             ])
             if mine {
-                bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12).isActive = true
+                unit.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12).isActive = true
             } else {
-                bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12).isActive = true
+                unit.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12).isActive = true
             }
             list.addArrangedSubview(row)
             lastRow = row
