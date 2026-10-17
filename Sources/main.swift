@@ -123,6 +123,16 @@ final class AvatarLoader {
     static let shared = AvatarLoader()
     private let cache = NSCache<NSString, NSImage>()
 
+    /// Center-crops an image to a square so circular avatars get true "cover" behavior.
+    private func squareCropped(_ image: NSImage) -> NSImage {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return image }
+        let side = min(cg.width, cg.height)
+        guard side > 0 else { return image }
+        let rect = CGRect(x: (cg.width - side) / 2, y: (cg.height - side) / 2, width: side, height: side)
+        guard let cropped = cg.cropping(to: rect) else { return image }
+        return NSImage(cgImage: cropped, size: NSSize(width: side, height: side))
+    }
+
     func load(_ spec: String?, completion: @escaping (NSImage?) -> Void) {
         guard let spec = spec, !spec.isEmpty else { completion(nil); return }
         if let hit = cache.object(forKey: spec as NSString) { completion(hit); return }
@@ -132,8 +142,9 @@ final class AvatarLoader {
             URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
                 var image: NSImage?
                 if let data = data, let img = NSImage(data: data) {
-                    image = img
-                    self?.cache.setObject(img, forKey: spec as NSString)
+                    let square = self?.squareCropped(img) ?? img
+                    image = square
+                    self?.cache.setObject(square, forKey: spec as NSString)
                 }
                 DispatchQueue.main.async { completion(image) }
             }.resume()
@@ -141,8 +152,9 @@ final class AvatarLoader {
             let path = (spec as NSString).expandingTildeInPath
             var image: NSImage?
             if let img = NSImage(contentsOfFile: path) {
-                image = img
-                cache.setObject(img, forKey: spec as NSString)
+                let square = squareCropped(img)
+                image = square
+                cache.setObject(square, forKey: spec as NSString)
             }
             completion(image)
         }
@@ -210,7 +222,7 @@ final class AvatarView: NSView {
         addSubview(circle)
 
         let imageView = NSImageView(frame: circle.bounds)
-        imageView.imageScaling = .scaleProportionallyToFill
+        imageView.imageScaling = .scaleAxesIndependently // image is pre-cropped to a square
         imageView.autoresizingMask = [.width, .height]
         circle.addSubview(imageView)
 
