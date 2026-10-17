@@ -1,977 +1,386 @@
-import Cocoa
-
-// ============================================================================
-// Messenger Mini — floating chat-heads panel for macOS
 //
-// - Vertical avatar panel docked to the right screen edge (draggable)
-// - Click an avatar -> floating chat window with that conversation
-// - Conversations are configured by the user in ~/.messenger-mini/chats.json
-//   (message content is STATIC until a live Messenger data source is wired up)
-// - Clicking anything that needs the real Messenger opens the thread on
-//   messenger.com in the default browser (user is already logged in there)
-// ============================================================================
+//  main.swift
+//  Messenger Mini — bong bóng nổi bọc Messenger web (AppKit thuần, không SwiftUI).
+//
+//  Cách hoạt động:
+//   - Cửa sổ chat là một WKWebView mở https://www.messenger.com.
+//   - Bạn TỰ đăng nhập bằng tay 1 lần ngay trong app; phiên đăng nhập được
+//     macOS lưu trong cookie store của app (không qua tay ai khác).
+//   - JavaScript inject vào trang đọc document.title ("(3) Messenger") để lấy
+//     số tin chưa đọc, báo về native qua WKScriptMessageHandler → hiện badge
+//     đỏ trên bong bóng.
+//   - Bấm bong bóng: ẩn/hiện cửa sổ chat. Chuột phải: menu (đăng xuất, thoát).
+//
+//  Lưu ý trung thực:
+//   - Đây là web Messenger chạy trong app của bạn, KHÔNG phải API chính thức.
+//   - Nếu Meta đổi cấu trúc trang/tiêu đề, badge có thể đọc sai — cửa sổ chat
+//     vẫn dùng bình thường.
+//   - App cần mạng (mở messenger.com) và bạn phải tự đăng nhập được.
 
-// MARK: - Model
+import AppKit
+import WebKit
 
-struct ChatMessage: Codable {
-    var from: String          // "me" | "them"
-    var text: String
-    var seen: Bool = false    // "me" only: show blue seen checkmarks under the bubble
-    var reaction: String?     // optional emoji reaction shown under the bubble
+// MARK: - Hằng số
+
+private enum Mini {
+    static let bubbleDiameter: CGFloat = 68
+    static let bubbleColor = NSColor(red: 0.0, green: 0.52, blue: 1.0, alpha: 1.0) // #0084FF
+    static let chatURL = URL(string: "https://www.messenger.com")!
+    static let originKey = "messengerMini.bubbleOrigin" // UserDefaults
+    static let chatFrameKey = "NSWindow Frame MessengerMiniChat" // autosave của NSWindow
+    static let dragThreshold: CGFloat = 4
 }
 
-struct ChatConfig: Codable {
-    var name: String
-    var avatar: String?       // local path (~/... ok) or https URL; empty -> initial letter
-    var url: String           // e.g. https://www.messenger.com/t/123456
-    var unread: Int = 0
-    var preview: String?      // static subtitle shown under the name
-    var messages: [ChatMessage] = []
-}
-
-struct AppConfig: Codable {
-    var chats: [ChatConfig] = []
-}
-
-// MARK: - Config store (~/.messenger-mini/chats.json, watched for changes)
-
-final class ConfigStore {
-    static let shared = ConfigStore()
-
-    let folder: URL
-    let file: URL
-    var config = AppConfig()
-    var onChange: (() -> Void)?
-
-    private var watcher: DispatchSourceFileSystemObject?
-
-    private init() {
-        folder = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".messenger-mini", isDirectory: true)
-        file = folder.appendingPathComponent("chats.json")
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: file.path) {
-            writeSample()
+/// JavaScript inject vào messenger.com: đọc số tin chưa đọc từ document.title.
+/// Messenger web tự thêm "(N)" vào đầu title khi có tin chưa đọc, ví dụ "(3) Messenger".
+private enum MiniJS {
+    static let unreadCounter = """
+    (function() {
+      function report() {
+        try {
+          var m = document.title.match(/^\\((\\d+)\\)/);
+          window.webkit.messageHandlers.unread.postMessage(m ? parseInt(m[1], 10) : 0);
+        } catch (e) { /* bỏ qua */ }
+      }
+      var tries = 0;
+      var timer = setInterval(function() {
+        tries += 1;
+        if (document.head || tries > 150) {
+          clearInterval(timer);
+          if (document.head) {
+            new MutationObserver(report).observe(document.head, {
+              childList: true, subtree: true, characterData: true
+            });
+          }
+          report();
         }
-        reload()
-        startWatching()
-    }
-
-    func openFolder() {
-        NSWorkspace.shared.open(folder)
-    }
-
-    func reload() {
-        if let data = try? Data(contentsOf: file),
-           let decoded = try? JSONDecoder().decode(AppConfig.self, from: data) {
-            config = decoded
-        }
-        DispatchQueue.main.async { [weak self] in self?.onChange?() }
-    }
-
-    private func writeSample() {
-        let sample = AppConfig(chats: [
-            ChatConfig(
-                name: "Mèo Cam",
-                avatar: "",
-                url: "https://www.messenger.com/",
-                unread: 2,
-                preview: "Chà",
-                messages: [
-                    ChatMessage(from: "them", text: "Chà"),
-                    ChatMessage(from: "them", text: "Messenger nay có tính năng mới nhỉ"),
-                    ChatMessage(from: "them", text: "Tiện thật đó"),
-                    ChatMessage(from: "me", text: "Quá ngon luôn ấy chứ"),
-                    ChatMessage(from: "me", text: "Hiện tại xài thấy khá là oke nha", seen: true, reaction: "😃"),
-                ]
-            ),
-            ChatConfig(
-                name: "Nhóm lớp",
-                avatar: "",
-                url: "https://www.messenger.com/",
-                unread: 0,
-                preview: "Hẹn cuối tuần nhé",
-                messages: [
-                    ChatMessage(from: "them", text: "Cuối tuần này mọi người rảnh không?"),
-                    ChatMessage(from: "me", text: "Tôi rảnh chiều thứ 7 nha"),
-                ]
-            ),
-        ])
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(sample) {
-            try? data.write(to: file)
-        }
-    }
-
-    private func startWatching() {
-        let fd = open(file.path, O_EVTONLY)
-        guard fd >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.write, .delete, .rename],
-            queue: .main
-        )
-        source.setEventHandler { [weak self] in self?.reload() }
-        source.setCancelHandler { close(fd) }
-        source.resume()
-        watcher = source
-    }
+      }, 200);
+    })();
+    """
 }
 
-// MARK: - Avatar image loading (local file or https, in-memory cache)
+// MARK: - Cầu JS → Native (wrapper weak, tránh retain-cycle)
 
-final class AvatarLoader {
-    static let shared = AvatarLoader()
-    private let cache = NSCache<NSString, NSImage>()
+/// WKUserContentController giữ handler rất lâu nên không được để nó giữ
+/// AppDelegate (sẽ tạo chu trình giữ). Wrapper này chỉ giữ weak.
+private final class UnreadScriptHandler: NSObject, WKScriptMessageHandler {
+    weak var target: AppDelegate?
 
-    /// Center-crops an image to a square so circular avatars get true "cover" behavior.
-    private func squareCropped(_ image: NSImage) -> NSImage {
-        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return image }
-        let side = min(cg.width, cg.height)
-        guard side > 0 else { return image }
-        let rect = CGRect(x: (cg.width - side) / 2, y: (cg.height - side) / 2, width: side, height: side)
-        guard let cropped = cg.cropping(to: rect) else { return image }
-        return NSImage(cgImage: cropped, size: NSSize(width: side, height: side))
-    }
-
-    func load(_ spec: String?, completion: @escaping (NSImage?) -> Void) {
-        guard let spec = spec, !spec.isEmpty else { completion(nil); return }
-        if let hit = cache.object(forKey: spec as NSString) { completion(hit); return }
-
-        if spec.hasPrefix("http://") || spec.hasPrefix("https://") {
-            guard let url = URL(string: spec) else { completion(nil); return }
-            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-                var image: NSImage?
-                if let data = data, let img = NSImage(data: data) {
-                    let square = self?.squareCropped(img) ?? img
-                    image = square
-                    self?.cache.setObject(square, forKey: spec as NSString)
-                }
-                DispatchQueue.main.async { completion(image) }
-            }.resume()
+    func userContentController(_ ucc: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "unread" else { return }
+        let count: Int
+        if let n = message.body as? Int {
+            count = n
+        } else if let n = message.body as? Double {
+            count = Int(n)
         } else {
-            let path = (spec as NSString).expandingTildeInPath
-            var image: NSImage?
-            if let img = NSImage(contentsOfFile: path) {
-                let square = squareCropped(img)
-                image = square
-                cache.setObject(square, forKey: spec as NSString)
+            count = 0
+        }
+        target?.setUnreadCount(count)
+    }
+}
+
+// MARK: - Bong bóng
+
+private final class BubbleView: NSView {
+
+    var unreadCount: Int = 0 { didSet { needsDisplay = true } }
+    var onTap: (() -> Void)?
+    var onToggleChat: (() -> Void)?
+    var onLogout: (() -> Void)?
+    var onQuit: (() -> Void)?
+
+    private var pressPoint: NSPoint = .zero
+    private var pressOrigin: NSPoint = .zero
+    private var dragged = false
+
+    // MARK: Vẽ
+
+    override func draw(_ dirtyRect: NSRect) {
+        // Hình tròn xanh
+        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 3, dy: 3))
+        Mini.bubbleColor.setFill()
+        circle.fill()
+
+        // Icon message.fill trắng, căn giữa
+        if let symbol = NSImage(systemSymbolName: "message.fill",
+                                accessibilityDescription: "Messenger") {
+            let iconSize = NSSize(width: 30, height: 30)
+            let white = NSImage(size: iconSize, flipped: false) { rect in
+                NSColor.white.setFill()
+                rect.fill()
+                symbol.draw(in: rect,
+                            from: NSRect(origin: .zero, size: symbol.size),
+                            operation: .destinationIn,
+                            fraction: 1.0)
+                return true
             }
-            completion(image)
-        }
-    }
-}
-
-// MARK: - Small red unread badge
-
-final class BadgeView: NSView {
-    var count: Int = 0 {
-        didSet { isHidden = count <= 0; needsDisplay = true }
-    }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        isHidden = true
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard count > 0 else { return }
-        let d = min(bounds.width, bounds.height)
-        let rect = NSRect(x: bounds.maxX - d, y: bounds.maxY - d, width: d, height: d)
-        NSBezierPath(ovalIn: rect).fill(with: .systemRed)
-        let text = count > 99 ? "99+" : "\(count)"
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .bold),
-            .foregroundColor: NSColor.white,
-        ]
-        let size = (text as NSString).size(withAttributes: attrs)
-        (text as NSString).draw(
-            at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
-            withAttributes: attrs
-        )
-    }
-}
-
-extension NSBezierPath {
-    func fill(with color: NSColor) {
-        color.setFill()
-        fill()
-    }
-}
-
-// MARK: - Circular clickable avatar
-
-final class AvatarView: NSView {
-    var onClick: (() -> Void)?
-
-    init(diameter: CGFloat, name: String, avatarSpec: String?, unread: Int, onClick: @escaping () -> Void) {
-        self.onClick = onClick
-        super.init(frame: NSRect(x: 0, y: 0, width: diameter, height: diameter))
-        wantsLayer = true
-        translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: diameter).isActive = true
-        heightAnchor.constraint(equalToConstant: diameter).isActive = true
-
-        let circle = NSView(frame: bounds)
-        circle.wantsLayer = true
-        circle.layer?.cornerRadius = diameter / 2
-        circle.layer?.masksToBounds = true
-        circle.layer?.backgroundColor = NSColor.systemGray.cgColor
-        circle.autoresizingMask = [.width, .height]
-        addSubview(circle)
-
-        let imageView = NSImageView(frame: circle.bounds)
-        imageView.imageScaling = .scaleAxesIndependently // image is pre-cropped to a square
-        imageView.autoresizingMask = [.width, .height]
-        circle.addSubview(imageView)
-
-        let initial = name.first.map { String($0).uppercased() } ?? "?"
-        let label = NSTextField(labelWithString: initial)
-        label.font = NSFont.systemFont(ofSize: diameter * 0.38, weight: .semibold)
-        label.textColor = .white
-        label.alignment = .center
-        label.frame = circle.bounds
-        label.autoresizingMask = [.width, .height]
-        circle.addSubview(label)
-
-        AvatarLoader.shared.load(avatarSpec) { img in
-            guard let img = img else { return }
-            imageView.image = img
-            label.isHidden = true
+            white.draw(in: NSRect(x: (bounds.width - iconSize.width) / 2,
+                                  y: (bounds.height - iconSize.height) / 2,
+                                  width: iconSize.width,
+                                  height: iconSize.height))
         }
 
-        let badge = BadgeView(frame: NSRect(x: diameter - 20, y: diameter - 22, width: 20, height: 20))
-        badge.count = unread
-        badge.autoresizingMask = [.minXMargin, .maxYMargin]
-        addSubview(badge)
+        // Badge đỏ: số tin chưa đọc, góc trên-phải
+        if unreadCount > 0 {
+            let text = unreadCount > 99 ? "99+" : "\(unreadCount)"
+            let font = NSFont.boldSystemFont(ofSize: 13)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.white
+            ]
+            let ts = (text as NSString).size(withAttributes: attrs)
+            let radius = max(13, ts.width / 2 + 7)
+            let center = NSPoint(x: bounds.maxX - radius - 2,
+                                 y: bounds.maxY - radius - 2)
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: NSRect(x: center.x - radius,
+                                       y: center.y - radius,
+                                       width: radius * 2,
+                                       height: radius * 2)).fill()
+            (text as NSString).draw(at: NSPoint(x: center.x - ts.width / 2,
+                                                y: center.y - ts.height / 2 + 1),
+                                    withAttributes: attrs)
+        }
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    // MARK: Kéo / bấm (phân biệt bằng ngưỡng 4pt)
 
-    override func mouseDown(with event: NSEvent) { onClick?() }
-
-    // Route clicks anywhere inside the avatar (label, image, badge subviews)
-    // to this view, otherwise subviews swallow the click and onClick never fires.
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        guard super.hitTest(point) != nil else { return nil }
-        return self
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
-}
-
-// MARK: - Deterministic window backgrounds (do not rely on vibrancy materials)
-
-/// Dark translucent rounded bar for the avatar panel (matches the target UI).
-final class PanelBackgroundView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds, xRadius: 20, yRadius: 20)
-        NSColor(white: 0.16, alpha: 0.84).setFill()
-        path.fill()
-        NSColor(white: 1.0, alpha: 0.14).setStroke()
-        path.lineWidth = 0.5
-        path.stroke()
-    }
-}
-
-/// Light rounded background for the chat window.
-final class ChatBackgroundView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16)
-        NSColor(white: 1.0, alpha: 0.97).setFill()
-        path.fill()
-        NSColor.separatorColor.setStroke()
-        path.lineWidth = 0.5
-        path.stroke()
-    }
-}
-
-// MARK: - Drag handle (pill) for moving the panel
-
-final class DragView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        let w: CGFloat = 36, h: CGFloat = 5
-        let r = NSRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
-        NSBezierPath(roundedRect: r, xRadius: h / 2, yRadius: h / 2).fill(with: .tertiaryLabelColor)
+    override func mouseDown(with event: NSEvent) {
+        pressPoint = event.locationInWindow
+        pressOrigin = window?.frame.origin ?? .zero
+        dragged = false
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let w = window else { return }
-        var o = w.frame.origin
-        o.x += event.deltaX
-        o.y -= event.deltaY
-        w.setFrameOrigin(o)
+        guard let win = window else { return }
+        let cur = event.locationInWindow
+        let dx = cur.x - pressPoint.x
+        let dy = cur.y - pressPoint.y
+        if abs(dx) + abs(dy) > Mini.dragThreshold { dragged = true }
+        win.setFrameOrigin(NSPoint(x: pressOrigin.x + dx, y: pressOrigin.y + dy))
     }
 
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .openHand)
+    override func mouseUp(with event: NSEvent) {
+        if !dragged { onTap?() }
+        clampOnScreen()
+        saveOrigin()
+    }
+
+    private func clampOnScreen() {
+        guard let win = window, let screen = win.screen ?? NSScreen.main else { return }
+        let vf = screen.visibleFrame
+        var o = win.frame.origin
+        let s = win.frame.size
+        // Cho phép tràn mép một chút kiểu chat-heads, nhưng luôn chừa 40pt để túm lại
+        o.x = min(max(o.x, vf.minX - s.width + 40), vf.maxX - 40)
+        o.y = min(max(o.y, vf.minY - s.height + 40), vf.maxY - 40)
+        win.setFrameOrigin(o)
+    }
+
+    private func saveOrigin() {
+        guard let o = window?.frame.origin else { return }
+        UserDefaults.standard.set("\(o.x),\(o.y)", forKey: Mini.originKey)
+    }
+
+    // MARK: Menu chuột phải
+
+    @objc private func menuToggleChat(_ sender: NSMenuItem) { onToggleChat?() }
+    @objc private func menuLogout(_ sender: NSMenuItem) { onLogout?() }
+    @objc private func menuQuit(_ sender: NSMenuItem) { onQuit?() }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+        func item(_ title: String, _ sel: Selector) -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            i.target = self
+            return i
+        }
+        menu.addItem(item("Mở/đóng cửa sổ chat", #selector(menuToggleChat)))
+        menu.addItem(item("Đăng xuất Messenger…", #selector(menuLogout)))
+        menu.addItem(.separator())
+        menu.addItem(item("Thoát", #selector(menuQuit)))
+        menu.popUp(positioning: nil,
+                   at: convert(event.locationInWindow, from: nil),
+                   in: self)
     }
 }
 
-// MARK: - Floating avatar panel
+private final class BubbleWindow: NSPanel {
 
-final class PanelController: NSObject {
-    static var lastFrame: NSRect = .zero
+    let bubbleView = BubbleView()
 
-    private let window: NSWindow
-    private let avatarStack = NSStackView()
-    private var collapsed = false
-    private var popups: [String: NSWindow] = [:]
-    private let panelWidth: CGFloat = 76
-    private let originKey = "MessengerMiniPanelOrigin"
-
-    override init() {
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 200),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.level = .floating
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
-
-        let bg = PanelBackgroundView(frame: window.contentView!.bounds)
-        bg.autoresizingMask = [.width, .height]
-        window.contentView = bg
-
-        super.init()
-
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .centerX
-        root.spacing = 8
-        root.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(root)
-        NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: bg.topAnchor, constant: 10),
-            root.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            root.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -10),
-        ])
-
-        let handle = DragView()
-        handle.translatesAutoresizingMaskIntoConstraints = false
-        handle.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        handle.widthAnchor.constraint(equalToConstant: panelWidth - 16).isActive = true
-        handle.toolTip = "Kéo để di chuyển"
-        root.addArrangedSubview(handle)
-
-        avatarStack.orientation = .vertical
-        avatarStack.alignment = .centerX
-        avatarStack.spacing = 10
-        avatarStack.translatesAutoresizingMaskIntoConstraints = false
-        root.addArrangedSubview(avatarStack)
-
-        let buttons = NSStackView()
-        buttons.orientation = .horizontal
-        buttons.alignment = .centerY
-        buttons.spacing = 6
-        buttons.translatesAutoresizingMaskIntoConstraints = false
-        buttons.addArrangedSubview(makeIconButton(symbol: "message.circle.fill", tint: .systemBlue, tip: "Mở Messenger", action: #selector(openMessenger)))
-        buttons.addArrangedSubview(makeIconButton(symbol: "square.and.pencil", tint: .labelColor, tip: "Tin nhắn mới", action: #selector(composeNew)))
-        buttons.addArrangedSubview(makeIconButton(symbol: "ellipsis", tint: .secondaryLabelColor, tip: "Thêm", action: #selector(showMenu)))
-        root.addArrangedSubview(buttons)
-
-        ConfigStore.shared.onChange = { [weak self] in self?.rebuild() }
-        rebuild()
+    init() {
+        let d = Mini.bubbleDiameter
+        super.init(contentRect: NSRect(x: 0, y: 0, width: d, height: d),
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered,
+                   defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        bubbleView.frame = NSRect(x: 0, y: 0, width: d, height: d)
+        bubbleView.autoresizingMask = [.width, .height]
+        contentView = bubbleView
         restoreOrigin()
-        updatePreviewPopups()
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(saveOrigin),
-            name: NSWindow.didMoveNotification, object: window
-        )
-        window.orderFront(nil)
-        Self.lastFrame = window.frame
-    }
-
-    private func makeIconButton(symbol: String, tint: NSColor, tip: String, action: Selector) -> NSButton {
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip) ?? NSImage()
-        let b = NSButton(image: image, target: self, action: action)
-        b.isBordered = false
-        b.contentTintColor = tint
-        b.toolTip = tip
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        b.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        return b
-    }
-
-    private func rebuild() {
-        let chats = ConfigStore.shared.config.chats
-        for v in avatarStack.arrangedSubviews {
-            avatarStack.removeArrangedSubview(v)
-            v.removeFromSuperview()
-        }
-        if !collapsed {
-            for chat in chats {
-                let av = AvatarView(diameter: 54, name: chat.name, avatarSpec: chat.avatar, unread: chat.unread) {
-                    ChatWindowController.toggle(chat)
-                }
-                av.toolTip = chat.name
-                avatarStack.addArrangedSubview(av)
-            }
-        }
-        avatarStack.isHidden = collapsed || chats.isEmpty
-        layoutWindow()
-        updatePreviewPopups()
-    }
-
-    private func layoutWindow() {
-        let chats = ConfigStore.shared.config.chats
-        let n = (collapsed || chats.isEmpty) ? 0 : chats.count
-        var h: CGFloat = 10 + 22 + 8            // top + handle + spacing
-        if n > 0 { h += CGFloat(n) * 54 + CGFloat(n - 1) * 10 + 8 }
-        h += 40 + 10                             // buttons + bottom
-        let old = window.frame
-        let dy = h - old.height
-        window.setFrame(NSRect(x: old.origin.x, y: old.origin.y - dy, width: panelWidth, height: h), display: true)
-        Self.lastFrame = window.frame
     }
 
     private func restoreOrigin() {
-        if let s = UserDefaults.standard.string(forKey: originKey) {
+        let d = Mini.bubbleDiameter
+        var origin: NSPoint?
+        if let s = UserDefaults.standard.string(forKey: Mini.originKey) {
             let parts = s.split(separator: ",").compactMap { Double($0) }
-            if parts.count == 2 {
-                var f = window.frame
-                f.origin = NSPoint(x: parts[0], y: parts[1])
-                window.setFrame(f, display: false)
-                return
-            }
+            if parts.count == 2 { origin = NSPoint(x: parts[0], y: parts[1]) }
         }
-        // First launch: dock to the right edge, vertically centered
-        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        var f = window.frame
-        f.origin = NSPoint(x: screen.maxX - f.width - 12, y: screen.midY - f.height / 2)
-        window.setFrame(f, display: false)
-    }
-
-    @objc private func saveOrigin() {
-        let o = window.frame.origin
-        UserDefaults.standard.set("\(o.x),\(o.y)", forKey: originKey)
-        Self.lastFrame = window.frame
-        updatePreviewPopups()
-    }
-
-    /// Floating ":)))" preview bubbles for chats with unread messages,
-    /// parked to the left of their avatar (like image 1).
-    private func updatePreviewPopups() {
-        for w in popups.values { w.orderOut(nil) }
-        popups.removeAll()
-        guard !collapsed else { return }
-        window.layoutIfNeeded()
-
-        let chats = ConfigStore.shared.config.chats
-        let rows = avatarStack.arrangedSubviews
-        for (i, chat) in chats.enumerated() {
-            guard chat.unread > 0,
-                  let preview = chat.preview, !preview.isEmpty,
-                  i < rows.count,
-                  let row = rows[i].superview else { continue }
-            let frameInWindow = row.convert(rows[i].frame, to: nil)
-            let frameOnScreen = window.convertToScreen(frameInWindow)
-
-            let bubble = PreviewBubble(text: preview) { ChatWindowController.toggle(chat) }
-            let size = bubble.contentSize
-            let pw = NSWindow(contentRect: NSRect(origin: .zero, size: size),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
-            pw.level = .floating
-            pw.isOpaque = false
-            pw.backgroundColor = .clear
-            pw.hasShadow = false
-            pw.collectionBehavior = [.canJoinAllSpaces, .stationary]
-            bubble.frame = NSRect(origin: .zero, size: size)
-            bubble.autoresizingMask = [.width, .height]
-            pw.contentView = bubble
-            pw.setFrameOrigin(NSPoint(x: frameOnScreen.minX - size.width - 4,
-                                      y: frameOnScreen.midY - size.height / 2))
-            pw.orderFront(nil)
-            popups[chat.name + "#" + chat.url] = pw
+        if origin == nil, let vf = NSScreen.main?.visibleFrame {
+            origin = NSPoint(x: vf.maxX - d - 24, y: vf.minY + 24) // góc dưới-phải
         }
-    }
-
-    private func openURL(_ string: String) {
-        if let url = URL(string: string) {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc private func openMessenger() { openURL("https://www.messenger.com/") }
-
-    @objc private func composeNew() { openURL("https://www.messenger.com/new") }
-
-    @objc private func toggleCollapse() {
-        collapsed.toggle()
-        rebuild()
-    }
-
-    @objc private func reloadConfig() { ConfigStore.shared.reload() }
-
-    @objc private func openConfigFolder() { ConfigStore.shared.openFolder() }
-
-    @objc private func quit() { NSApp.terminate(nil) }
-
-    @objc private func showMenu(_ sender: NSButton) {
-        let menu = NSMenu()
-        let toggle = NSMenuItem(title: collapsed ? "Mở rộng panel" : "Thu gọn panel",
-                                action: #selector(toggleCollapse), keyEquivalent: "")
-        toggle.target = self
-        let reload = NSMenuItem(title: "Tải lại cấu hình", action: #selector(reloadConfig), keyEquivalent: "")
-        reload.target = self
-        let folder = NSMenuItem(title: "Mở thư mục cấu hình", action: #selector(openConfigFolder), keyEquivalent: "")
-        folder.target = self
-        let quitItem = NSMenuItem(title: "Thoát", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(toggle)
-        menu.addItem(reload)
-        menu.addItem(folder)
-        menu.addItem(.separator())
-        menu.addItem(quitItem)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+        setFrameOrigin(origin ?? .zero)
     }
 }
 
-// MARK: - Chat message bubble
+// MARK: - Cửa sổ chat (WKWebView bọc messenger.com)
 
-final class BubbleView: NSView {
-    private let mine: Bool
+private final class ChatWindow: NSWindow {
 
-    init(text: String, mine: Bool) {
-        self.mine = mine
-        super.init(frame: .zero)
-        wantsLayer = true
-        translatesAutoresizingMaskIntoConstraints = false
+    let webView: WKWebView
 
-        let label = NSTextField(labelWithString: text)
-        label.font = NSFont.systemFont(ofSize: 14)
-        label.textColor = mine ? .white : .labelColor
-        label.maximumNumberOfLines = 0
-        label.lineBreakMode = .byWordWrapping
-        label.preferredMaxLayoutWidth = 238
-        label.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(label)
-        NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: topAnchor, constant: 9),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 13),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -13),
-        ])
-    }
+    init(scriptHandler: UnreadScriptHandler) {
+        let config = WKWebViewConfiguration()
+        // Cookie store persistent của hệ thống → đăng nhập 1 lần, nhớ mãi
+        config.websiteDataStore = .default()
+        let ucc = WKUserContentController()
+        ucc.addUserScript(WKUserScript(source: MiniJS.unreadCounter,
+                                      injectionTime: .atDocumentEnd,
+                                      forMainFrameOnly: true))
+        ucc.add(scriptHandler, name: "unread")
+        config.userContentController = ucc
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        webView = WKWebView(frame: .zero, configuration: config)
+        webView.autoresizingMask = [.width, .height]
 
-    override func draw(_ dirtyRect: NSRect) {
-        (mine ? NSColor.systemBlue : NSColor.controlColor).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 17, yRadius: 17).fill()
-    }
-}
-
-// MARK: - Message unit: bubble + optional reaction + seen checkmarks
-
-final class MessageUnitView: NSView {
-    init(message: ChatMessage) {
-        super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = false
-        let mine = message.from == "me"
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = mine ? .trailing : .leading
-        stack.spacing = 2
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
-
-        stack.addArrangedSubview(BubbleView(text: message.text, mine: mine))
-
-        if let reaction = message.reaction, !reaction.isEmpty {
-            let r = NSTextField(labelWithString: reaction)
-            r.font = NSFont.systemFont(ofSize: 15)
-            stack.addArrangedSubview(r)
-        }
-
-        if mine && message.seen {
-            let s = NSTextField(labelWithString: "✓✓")
-            s.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-            s.textColor = .systemBlue
-            stack.addArrangedSubview(s)
-        }
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-}
-
-// MARK: - Floating chat window (one per conversation)
-
-final class ChatWindowController: NSObject {
-    private static var open: [String: ChatWindowController] = [:]
-
-    private static func key(for chat: ChatConfig) -> String {
-        chat.name + "#" + chat.url
-    }
-
-    static func toggle(_ chat: ChatConfig) {
-        let k = key(for: chat)
-        if let existing = open[k] {
-            existing.window.close()
-            return
-        }
-        let controller = ChatWindowController(chat: chat)
-        open[k] = controller
-        controller.window.makeKeyAndOrderFront(nil)
-    }
-
-    let window: NSWindow
-    private let chat: ChatConfig
-
-    private init(chat: ChatConfig) {
-        self.chat = chat
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 540),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.level = .floating
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
-
-        let bg = ChatBackgroundView(frame: window.contentView!.bounds)
-        bg.autoresizingMask = [.width, .height]
-        window.contentView = bg
-
-        super.init()
-        build(in: bg)
-        placeNextToPanel()
-
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(windowClosed),
-            name: NSWindow.willCloseNotification, object: window
-        )
-    }
-
-    @objc private func windowClosed() {
-        Self.open.removeValue(forKey: Self.key(for: chat))
-    }
-
-    private func openThreadURL() {
-        let target = chat.url.isEmpty ? "https://www.messenger.com/" : chat.url
-        if let url = URL(string: target) {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    private func placeNextToPanel() {
-        let panel = PanelController.lastFrame
-        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        var f = window.frame
-        if panel.width > 0 {
-            f.origin = NSPoint(x: panel.minX - f.width - 12, y: panel.minY - 60)
-        } else {
-            f.origin = NSPoint(x: screen.maxX - f.width - 100, y: screen.midY - f.height / 2)
-        }
-        // Clamp inside the visible screen
-        f.origin.x = max(screen.minX + 8, min(f.origin.x, screen.maxX - f.width - 8))
-        f.origin.y = max(screen.minY + 8, min(f.origin.y, screen.maxY - f.height - 8))
-        window.setFrame(f, display: false)
-    }
-
-    private func headerButton(symbol: String, tint: NSColor, tip: String, action: Selector) -> NSButton {
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip) ?? NSImage()
-        let b = NSButton(image: image, target: self, action: action)
-        b.isBordered = false
-        b.contentTintColor = tint
-        b.toolTip = tip
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        b.heightAnchor.constraint(equalToConstant: 30).isActive = true
-        return b
-    }
-
-    private func build(in bg: NSView) {
-        // ---- Header ----
-        let header = NSView()
-        header.translatesAutoresizingMaskIntoConstraints = false
-        header.heightAnchor.constraint(equalToConstant: 64).isActive = true
-        bg.addSubview(header)
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: bg.topAnchor),
-            header.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-        ])
-
-        let avatar = AvatarView(diameter: 40, name: chat.name, avatarSpec: chat.avatar, unread: 0) { [weak self] in
-            self?.openThread()
-        }
-        header.addSubview(avatar)
-        avatar.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            avatar.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
-            avatar.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-        ])
-
-        let nameLabel = NSTextField(labelWithString: chat.name)
-        nameLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        header.addSubview(nameLabel)
-
-        let subLabel = NSTextField(labelWithString: chat.preview ?? "Bấm để mở trên Messenger")
-        subLabel.font = NSFont.systemFont(ofSize: 12)
-        subLabel.textColor = .secondaryLabelColor
-        subLabel.lineBreakMode = .byTruncatingTail
-        subLabel.translatesAutoresizingMaskIntoConstraints = false
-        header.addSubview(subLabel)
-
-        NSLayoutConstraint.activate([
-            nameLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
-            nameLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
-            subLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            subLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
-            subLabel.trailingAnchor.constraint(lessThanOrEqualTo: header.trailingAnchor, constant: -110),
-        ])
-
-        let headerButtons = NSStackView()
-        headerButtons.orientation = .horizontal
-        headerButtons.spacing = 2
-        headerButtons.translatesAutoresizingMaskIntoConstraints = false
-        headerButtons.addArrangedSubview(headerButton(symbol: "phone.fill", tint: .systemPurple, tip: "Gọi (mở Messenger)", action: #selector(openThread)))
-        headerButtons.addArrangedSubview(headerButton(symbol: "video.fill", tint: .systemPurple, tip: "Gọi video (mở Messenger)", action: #selector(openThread)))
-        headerButtons.addArrangedSubview(headerButton(symbol: "xmark", tint: .secondaryLabelColor, tip: "Đóng", action: #selector(closeWindow)))
-        header.addSubview(headerButtons)
-        NSLayoutConstraint.activate([
-            headerButtons.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -8),
-            headerButtons.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-        ])
-
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        bg.addSubview(divider)
-        NSLayoutConstraint.activate([
-            divider.topAnchor.constraint(equalTo: header.bottomAnchor),
-            divider.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
-            divider.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
-        ])
-
-        // ---- Messages ----
-        let scrollView = NSScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.hasVerticalScroller = true
-        scrollView.drawsBackground = false
-        scrollView.contentView.drawsBackground = false
-        bg.addSubview(scrollView)
-        NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 6),
-            scrollView.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-        ])
-
-        let list = NSStackView()
-        list.orientation = .vertical
-        list.alignment = .leading
-        list.spacing = 2
-        list.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = list
-        NSLayoutConstraint.activate([
-            list.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            list.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            list.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor, constant: 4),
-            list.bottomAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.bottomAnchor, constant: -4),
-        ])
-
-        var lastRow: NSView?
-        for msg in chat.messages {
-            let row = NSView()
-            row.translatesAutoresizingMaskIntoConstraints = false
-            row.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true
-            let mine = msg.from == "me"
-            let unit = MessageUnitView(message: msg)
-            row.addSubview(unit)
-            NSLayoutConstraint.activate([
-                unit.topAnchor.constraint(equalTo: row.topAnchor, constant: 3),
-                unit.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -3),
-                unit.widthAnchor.constraint(lessThanOrEqualToConstant: 270),
-            ])
-            if mine {
-                unit.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12).isActive = true
-            } else {
-                unit.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12).isActive = true
-            }
-            list.addArrangedSubview(row)
-            lastRow = row
-        }
-
-        // ---- Input bar ----
-        let inputBar = NSView()
-        inputBar.translatesAutoresizingMaskIntoConstraints = false
-        inputBar.heightAnchor.constraint(equalToConstant: 56).isActive = true
-        bg.addSubview(inputBar)
-        NSLayoutConstraint.activate([
-            inputBar.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 4),
-            inputBar.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            inputBar.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            inputBar.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
-        ])
-
-        let plus = headerButton(symbol: "plus.circle.fill", tint: .systemBlue, tip: "Mở trên Messenger", action: #selector(openThread))
-        plus.translatesAutoresizingMaskIntoConstraints = false
-        inputBar.addSubview(plus)
-        NSLayoutConstraint.activate([
-            plus.leadingAnchor.constraint(equalTo: inputBar.leadingAnchor, constant: 10),
-            plus.centerYAnchor.constraint(equalTo: inputBar.centerYAnchor),
-        ])
-
-        let input = NSTextField()
-        input.placeholderString = "Nhập tin nhắn... (Enter để mở trên Messenger)"
-        input.bezelStyle = .roundedBezel
-        input.focusRingType = .none
-        input.font = NSFont.systemFont(ofSize: 14)
-        input.target = self
-        input.action = #selector(openThread)
-        input.translatesAutoresizingMaskIntoConstraints = false
-        inputBar.addSubview(input)
-
-        let emoji = headerButton(symbol: "face.smiling", tint: .systemBlue, tip: "Mở trên Messenger", action: #selector(openThread))
-        let like = headerButton(symbol: "hand.thumbsup.fill", tint: .systemBlue, tip: "Mở trên Messenger", action: #selector(openThread))
-        inputBar.addSubview(emoji)
-        inputBar.addSubview(like)
-        emoji.translatesAutoresizingMaskIntoConstraints = false
-        like.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            input.leadingAnchor.constraint(equalTo: plus.trailingAnchor, constant: 8),
-            input.centerYAnchor.constraint(equalTo: inputBar.centerYAnchor),
-            input.heightAnchor.constraint(equalToConstant: 34),
-            emoji.leadingAnchor.constraint(equalTo: input.trailingAnchor, constant: 6),
-            emoji.centerYAnchor.constraint(equalTo: inputBar.centerYAnchor),
-            like.leadingAnchor.constraint(equalTo: emoji.trailingAnchor, constant: 2),
-            like.centerYAnchor.constraint(equalTo: inputBar.centerYAnchor),
-            like.trailingAnchor.constraint(equalTo: inputBar.trailingAnchor, constant: -8),
-        ])
-
-        // Scroll to the latest message
-        bg.layoutSubtreeIfNeeded()
-        if let last = lastRow {
-            scrollView.contentView.scrollToVisible(last.frame)
-        }
-    }
-
-    @objc private func openThread() {
-        openThreadURL()
-    }
-
-    @objc private func closeWindow() {
-        window.close()
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 420, height: 640),
+                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                   backing: .buffered,
+                   defer: false)
+        title = "Messenger"
+        minSize = NSSize(width: 320, height: 480)
+        isReleasedWhenClosed = false
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        contentView = webView
+        setFrameAutosaveName("MessengerMiniChat")
+        webView.load(URLRequest(url: Mini.chatURL))
     }
 }
 
-// MARK: - App
+// MARK: - AppDelegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    var panel: PanelController!
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+
+    private var bubble: BubbleWindow!
+    private var chat: ChatWindow!
+    private let scriptHandler = UnreadScriptHandler()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory) // no Dock icon
-        panel = PanelController()
+        NSApp.setActivationPolicy(.accessory) // không hiện Dock
+        buildMenu()
+        scriptHandler.target = self
+
+        bubble = BubbleWindow()
+        chat = ChatWindow(scriptHandler: scriptHandler)
+        chat.delegate = self
+        positionChatDefaultIfNeeded()
+
+        let bv = bubble.bubbleView
+        bv.onTap = { [weak self] in self?.toggleChat() }
+        bv.onToggleChat = { [weak self] in self?.toggleChat() }
+        bv.onLogout = { [weak self] in self?.logout() }
+        bv.onQuit = { NSApp.terminate(nil) }
+
+        bubble.orderFrontRegardless()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+    // MARK: Badge
+
+    func setUnreadCount(_ count: Int) {
+        DispatchQueue.main.async { [weak self] in
+            self?.bubble.bubbleView.unreadCount = count
+        }
+    }
+
+    // MARK: Chat window
+
+    private func toggleChat() {
+        if chat.isVisible {
+            chat.orderOut(nil)
+        } else {
+            chat.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Lần đầu chưa có frame lưu: đặt cửa sổ chat bên trái bong bóng.
+    private func positionChatDefaultIfNeeded() {
+        guard UserDefaults.standard.string(forKey: Mini.chatFrameKey) == nil,
+              let vf = NSScreen.main?.visibleFrame else { return }
+        let bf = bubble.frame
+        let cs = chat.frame.size
+        var x = bf.minX - cs.width - 12
+        var y = bf.minY
+        x = min(max(x, vf.minX + 12), vf.maxX - cs.width - 12)
+        y = min(max(y, vf.minY + 12), vf.maxY - cs.height - 12)
+        chat.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    /// Nút đỏ: ẩn cửa sổ thay vì đóng hẳn (bong bóng vẫn còn).
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+
+    // MARK: Đăng xuất (xóa phiên đăng nhập trong app)
+
+    private func logout() {
+        let alert = NSAlert()
+        alert.messageText = "Đăng xuất Messenger?"
+        alert.informativeText = "Phiên đăng nhập trong app sẽ bị xóa. Lần mở sau bạn sẽ phải đăng nhập lại."
+        alert.addButton(withTitle: "Đăng xuất")
+        alert.addButton(withTitle: "Hủy")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+            modifiedSince: Date(timeIntervalSince1970: 0)
+        ) { [weak self] in
+            guard let self else { return }
+            self.chat.webView.load(URLRequest(url: Mini.chatURL))
+            self.setUnreadCount(0)
+        }
+    }
+
+    // MARK: Menu (Cmd+Q)
+
+    private func buildMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Thoát Messenger Mini",
+                        action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+        NSApp.mainMenu = main
     }
 }
+
+// MARK: - main (top-level, không @main)
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
+let delegate = AppDelegate() // biến top-level: sống suốt vòng đời process
 app.delegate = delegate
 app.run()
-
-// MARK: - Message preview popup bubble (the ":)))" bubble next to an avatar)
-
-final class PreviewBubble: NSView {
-    private let onClick: (() -> Void)?
-    private let font = NSFont.systemFont(ofSize: 13)
-    private let hPad: CGFloat = 12
-    private let vPad: CGFloat = 8
-    private let tailWidth: CGFloat = 8
-    private let maxTextWidth: CGFloat = 170
-    let contentSize: NSSize
-
-    init(text: String, onClick: (() -> Void)? = nil) {
-        self.onClick = onClick
-
-        let label = NSTextField(labelWithString: text)
-        label.font = font
-        label.textColor = .labelColor
-        label.maximumNumberOfLines = 0
-        label.lineBreakMode = .byWordWrapping
-        label.isBordered = false
-        label.backgroundColor = .clear
-        // Measure with AppKit's own layout (handles diacritics correctly),
-        // then clamp to a single line when it fits.
-        label.preferredMaxLayoutWidth = 1000
-        let naturalW = ceil(label.intrinsicContentSize.width)
-        let w = min(naturalW, maxTextWidth)
-        label.preferredMaxLayoutWidth = w
-        let h = ceil(label.intrinsicContentSize.height)
-        contentSize = NSSize(width: w + hPad * 2 + tailWidth, height: h + vPad * 2)
-
-        super.init(frame: NSRect(origin: .zero, size: contentSize))
-        wantsLayer = true
-        label.frame = NSRect(x: hPad, y: vPad, width: w, height: h)
-        label.autoresizingMask = [.width, .height]
-        addSubview(label)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let bg = NSColor.textBackgroundColor
-        let bodyW = bounds.width - tailWidth
-        let body = NSRect(x: 0, y: 0, width: bodyW, height: bounds.height)
-        NSBezierPath(roundedRect: body, xRadius: 11, yRadius: 11).fill(with: bg)
-
-        // Little tail pointing right, toward the avatar
-        let tail = NSBezierPath()
-        tail.move(to: NSPoint(x: bodyW - 1, y: bounds.midY - 6))
-        tail.line(to: NSPoint(x: bounds.width, y: bounds.midY))
-        tail.line(to: NSPoint(x: bodyW - 1, y: bounds.midY + 6))
-        tail.close()
-        tail.fill(with: bg)
-
-        NSBezierPath(roundedRect: body, xRadius: 11, yRadius: 11).stroke(with: .separatorColor)
-    }
-
-    override func mouseDown(with event: NSEvent) { onClick?() }
-
-    // Same as AvatarView: make the whole bubble (including its text label) clickable.
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        guard super.hitTest(point) != nil else { return nil }
-        return self
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
-}
-
-extension NSBezierPath {
-    func stroke(with color: NSColor) {
-        color.setStroke()
-        lineWidth = 0.5
-        stroke()
-    }
-}
