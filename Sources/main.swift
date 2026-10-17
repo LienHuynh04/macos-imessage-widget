@@ -154,7 +154,10 @@ private enum MiniJS {
             var t = (a.innerText || '').split('\\n')[0].trim();
             name = t.substring(0, 40);
           }
-          if (name) out.push({id: id, name: name});
+          // Avatar: lấy ảnh đầu tiên trong dòng chat (currentSrc cho ảnh lazy-load)
+          var img = a.querySelector('img');
+          var avatar = img ? (img.currentSrc || img.src || '') : '';
+          if (name) out.push({id: id, name: name, avatar: avatar});
         });
         window.webkit.messageHandlers.threads.postMessage(JSON.stringify(out));
       } catch (e) { /* bo qua */ }
@@ -189,10 +192,11 @@ private final class UnreadScriptHandler: NSObject, WKScriptMessageHandler {
     }
 }
 
-/// 1 đoạn chat quét được từ inbox: id + tên hiển thị.
+/// 1 đoạn chat quét được từ inbox: id + tên hiển thị + URL avatar (có thể rỗng).
 private struct ScrapedThread: Codable {
     var id: String
     var name: String
+    var avatar: String
 }
 
 /// Cầu nối JS → Swift cho kết quả quét inbox (handler "threads").
@@ -437,10 +441,46 @@ private final class BubbleWindow: NSPanel {
 //  duyệt, copy URL có dạng .../t/123456...) + đặt tên hiển thị.
 // ============================================================
 
-/// 1 đoạn chat đã ghim: tên hiển thị + thread ID. Lưu JSON trong UserDefaults.
+/// 1 đoạn chat đã ghim: tên hiển thị + thread ID + URL avatar (nếu có).
+/// Lưu JSON trong UserDefaults. avatarURL có giá trị mặc định nil nên
+/// các head đã lưu từ trước (chưa có avatar) vẫn đọc được bình thường.
 private struct ChatHead: Codable {
     var name: String
     var threadID: String
+    var avatarURL: String? = nil
+}
+
+/// Tải + cache avatar: nhớ trong RAM (NSCache) và lưu file vào
+/// ~/Library/Caches để lần mở sau không phải tải lại.
+/// BÀI HỌC: đây là mẫu "async image loading" cơ bản nhất của AppKit.
+private final class AvatarLoader {
+    static let shared = AvatarLoader()
+    private let cache = NSCache<NSString, NSImage>()
+    private let dir: URL = FileManager.default
+        .urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("messenger-bubble-diy/avatars", isDirectory: true)
+
+    func load(urlString: String, key: String, completion: @escaping (NSImage?) -> Void) {
+        if let img = cache.object(forKey: key as NSString) {
+            completion(img); return
+        }
+        let file = dir.appendingPathComponent(key)
+        if let data = try? Data(contentsOf: file), let img = NSImage(data: data) {
+            cache.setObject(img, forKey: key as NSString)
+            completion(img); return
+        }
+        guard let url = URL(string: urlString) else { completion(nil); return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self, let data, let img = NSImage(data: data) else {
+                DispatchQueue.main.async { completion(nil) }; return
+            }
+            try? FileManager.default.createDirectory(at: self.dir,
+                                                     withIntermediateDirectories: true)
+            try? data.write(to: file)
+            self.cache.setObject(img, forKey: key as NSString)
+            DispatchQueue.main.async { completion(img) }
+        }.resume()
+    }
 }
 
 /// 1 head tròn: vẽ chữ cái đầu của tên, màu theo hash tên (nhận mặt bằng màu).
@@ -449,6 +489,9 @@ private final class HeadView: NSView {
     let head: ChatHead
     var onSelect: (() -> Void)?
     var onRemove: (() -> Void)?
+
+    /// Ảnh avatar (tải bất đồng bộ). Có ảnh thì vẽ ảnh, chưa có thì vẽ chữ cái.
+    var avatarImage: NSImage? { didSet { needsDisplay = true } }
 
     init(head: ChatHead, diameter: CGFloat) {
         self.head = head
@@ -465,9 +508,30 @@ private final class HeadView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 2, dy: 2))
+        let r = bounds.insetBy(dx: 2, dy: 2)
+        // Nền tròn (lộ ra nếu ảnh trong suốt hoặc chưa tải xong)
         circleColor.setFill()
-        circle.fill()
+        NSBezierPath(ovalIn: r).fill()
+
+        if let img = avatarImage, img.size.width > 0, img.size.height > 0 {
+            // Vẽ ảnh center-crop trong hình tròn: clip theo đường tròn rồi vẽ
+            // ảnh phóng to vừa khít (mẫu "avatar tròn" kinh điển).
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(ovalIn: r).addClip()
+            let iw = img.size.width, ih = img.size.height
+            let s = max(r.width / iw, r.height / ih)
+            let dw = iw * s, dh = ih * s
+            img.draw(in: NSRect(x: r.minX + (r.width - dw) / 2,
+                                y: r.minY + (r.height - dh) / 2,
+                                width: dw, height: dh),
+                     from: NSRect(origin: .zero, size: img.size),
+                     operation: .copy,
+                     fraction: 1.0)
+            NSGraphicsContext.restoreGraphicsState()
+            return
+        }
+
+        // Fallback: chữ cái đầu của tên
         let initial = String(head.name.prefix(1)).uppercased()
         let font = NSFont.boldSystemFont(ofSize: bounds.width * 0.42)
         let attrs: [NSAttributedString.Key: Any] = [
@@ -493,6 +557,15 @@ private final class HeadView: NSView {
         menu.popUp(positioning: nil,
                    at: convert(event.locationInWindow, from: nil),
                    in: self)
+    }
+}
+
+/// Nền thanh dọc chứa các head: bo góc, đen mờ (giống ảnh mẫu).
+private final class BarView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let p = NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16)
+        NSColor(white: 0.16, alpha: 0.92).setFill()
+        p.fill()
     }
 }
 
@@ -537,6 +610,13 @@ private final class HeadsPanel: NSPanel {
         setFrame(f, display: true)
         container.frame = NSRect(origin: .zero, size: contentRect(forFrameRect: f).size)
 
+        // Nền thanh (vẽ trước, nằm dưới các head)
+        let bar = BarView()
+        bar.frame = NSRect(origin: .zero,
+                           size: NSSize(width: Self.width, height: h))
+        bar.autoresizingMask = [.width, .height]
+        container.addSubview(bar)
+
         var y = h - gap - d
         for head in heads {
             let v = HeadView(head: head, diameter: d)
@@ -559,6 +639,19 @@ private final class HeadsPanel: NSPanel {
 
     @objc private func didTapAdd() { onAdd?() }
 
+    /// Tìm HeadView theo thread ID (để nạp avatar / tính vị trí).
+    func headView(forThreadID id: String) -> HeadView? {
+        container.subviews.compactMap { $0 as? HeadView }
+            .first { $0.head.threadID == id }
+    }
+
+    /// Tọa độ Y giữa head trên màn hình (để đặt thẻ chat ngang tầm head).
+    func screenYCenter(forThreadID id: String) -> CGFloat? {
+        guard let hv = headView(forThreadID: id),
+              let win = hv.window else { return nil }
+        return win.convertToScreen(hv.convert(hv.bounds, to: nil)).midY
+    }
+
     private func restoreOrigin() {
         var origin: NSPoint?
         if let s = UserDefaults.standard.string(forKey: Mini.headsOriginKey) {
@@ -574,18 +667,52 @@ private final class HeadsPanel: NSPanel {
 }
 
 // ============================================================
-//  PHẦN 6 — CỬA SỔ CHAT: WKWebView bọc messenger.com
+//  PHẦN 6 — THẺ CHAT: WKWebView trong "thẻ trắng bo góc" nổi
 //  ------------------------------------------------------------
-//  • websiteDataStore = .default() → cookie PERSISTENT của hệ thống:
-//    đăng nhập 1 lần, tắt app mở lại vẫn còn (giống Safari).
-//  • isReleasedWhenClosed = false + windowShouldClose → nút đỏ chỉ ẨN
-//    cửa sổ, không hủy (bấm bong bóng là mở lại ngay).
-//  • setFrameAutosaveName → macOS tự nhớ kích thước/vị trí cửa sổ.
+//  Giống ảnh mẫu: thẻ trắng bo góc, không thanh tiêu đề, có đuôi tam
+//  giác chỉ về phía dải heads. Kéo thẻ bằng thanh trắng 16pt ở đỉnh
+//  (webview nằm gọn bên dưới nên không che nút bấm của trang web).
+//  • websiteDataStore = .default() → cookie PERSISTENT: đăng nhập 1 lần.
+//  • isReleasedWhenClosed = false → ẩn/hiện chứ không hủy.
 // ============================================================
 
-private final class ChatWindow: NSWindow {
+/// Thanh kéo 16pt ở đỉnh thẻ: kéo để di chuyển cả thẻ chat.
+private final class DragStripView: NSView {
+    var onDrag: ((CGPoint) -> Void)?
+    private var start: NSPoint = .zero
+
+    override func mouseDown(with event: NSEvent) {
+        start = event.locationInWindow
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let cur = event.locationInWindow
+        onDrag?(CGPoint(x: cur.x - start.x, y: cur.y - start.y))
+        start = cur
+    }
+}
+
+/// Đuôi tam giác trắng ở mép phải thẻ, chỉ về phía dải heads.
+private final class TailView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: 2, y: 2))
+        p.line(to: NSPoint(x: 2, y: bounds.height - 2))
+        p.line(to: NSPoint(x: bounds.width - 1, y: bounds.height / 2))
+        p.close()
+        NSColor.white.setFill()
+        p.fill()
+    }
+}
+
+private final class ChatWindow: NSPanel {
+
+    static let cardSize = NSSize(width: 380, height: 560)
+    private static let stripHeight: CGFloat = 16
 
     let webView: WKWebView
+    private let dragStrip = DragStripView()
+    private let tailView = TailView()
 
     init(unreadHandler: UnreadScriptHandler, threadsHandler: ThreadsScriptHandler) {
         let config = WKWebViewConfiguration()
@@ -599,24 +726,68 @@ private final class ChatWindow: NSWindow {
         config.userContentController = ucc
 
         webView = WKWebView(frame: .zero, configuration: config)
-        webView.autoresizingMask = [.width, .height]
 
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 420, height: 640),
-                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
+        super.init(contentRect: NSRect(origin: .zero, size: Self.cardSize),
+                   styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered,
                    defer: false)
-        title = "Messenger"
-        minSize = NSSize(width: 320, height: 480)
-        isReleasedWhenClosed = false
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
         level = .floating
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate = false
-        contentView = webView
-        setFrameAutosaveName(Mini.chatFrameKey)
+        isReleasedWhenClosed = false
+
+        // Container trắng bo góc 18pt
+        let container = NSView(frame: NSRect(origin: .zero, size: Self.cardSize))
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.white.cgColor
+        container.layer?.cornerRadius = 18
+        container.layer?.masksToBounds = true
+        container.autoresizingMask = [.width, .height]
+        contentView = container
+
+        // WebView nằm dưới thanh kéo
+        webView.frame = NSRect(x: 0, y: 0,
+                               width: Self.cardSize.width,
+                               height: Self.cardSize.height - Self.stripHeight)
+        webView.autoresizingMask = [.width, .height]
+        container.addSubview(webView)
+
+        // Thanh kéo ở đỉnh (trắng, hòa vào thẻ)
+        dragStrip.frame = NSRect(x: 0,
+                                 y: Self.cardSize.height - Self.stripHeight,
+                                 width: Self.cardSize.width,
+                                 height: Self.stripHeight)
+        dragStrip.autoresizingMask = [.width, .minYMargin]
+        dragStrip.onDrag = { [weak self] d in
+            guard let w = self else { return }
+            w.setFrameOrigin(NSPoint(x: w.frame.origin.x + d.x,
+                                     y: w.frame.origin.y + d.y))
+        }
+        container.addSubview(dragStrip)
+
+        // Đuôi tam giác ở mép phải, giữa thẻ (sẽ dời theo head được bấm)
+        tailView.frame = NSRect(x: Self.cardSize.width - 18,
+                                y: Self.cardSize.height / 2 - 13,
+                                width: 18, height: 26)
+        tailView.autoresizingMask = [.minXMargin]
+        container.addSubview(tailView)
+
+        minSize = NSSize(width: 300, height: 420)
         webView.load(URLRequest(url: Mini.chatURL))
     }
 
-    /// Bật/tắt "luôn nằm trên" cho cửa sổ chat.
+    /// Dời đuôi tam giác tới vị trí Y (tọa độ trong thẻ) của head vừa bấm.
+    func moveTail(toLocalY y: CGFloat) {
+        var f = tailView.frame
+        let h = ChatWindow.cardSize.height
+        f.origin.y = min(max(y - f.height / 2, 8), h - f.height - 20)
+        tailView.frame = f
+    }
+
+    /// Bật/tắt "luôn nằm trên" cho thẻ chat.
     /// level .floating = trên hết; .normal = cửa sổ thường.
     func setAlwaysOnTop(_ on: Bool) {
         level = on ? .floating : .normal
@@ -638,6 +809,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var chat: ChatWindow!
     private var headsPanel: HeadsPanel!
     private var heads: [ChatHead] = []
+    private var openThreadID: String? // thread đang mở trong thẻ (nil = inbox/không có)
     private let scriptHandler = UnreadScriptHandler()
     private let threadsScriptHandler = ThreadsScriptHandler()
 
@@ -653,7 +825,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                           threadsHandler: threadsScriptHandler)
         chat.delegate = self
         chat.webView.navigationDelegate = self
-        positionChatDefaultIfNeeded()
 
         // Khôi phục màu bong bóng đã chọn lần trước
         let colorIndex = UserDefaults.standard.integer(forKey: Mini.colorIndexKey)
@@ -691,14 +862,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
     }
 
-    // ---- Mở/đóng cửa sổ chat ----
+    // ---- Mở/đóng thẻ chat ----
 
+    /// Bấm bong bóng: ẩn thẻ đang mở, hoặc mở lại thẻ ở vị trí mặc định
+    /// (cạnh dải heads, giữa màn hình).
     private func toggleChat() {
         if chat.isVisible {
             chat.orderOut(nil)
+            openThreadID = nil
         } else {
-            chat.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            openThreadID = nil
+            placeCard(nearScreenY: headsPanel.frame.midY)
+            showChatWindow()
         }
     }
 
@@ -734,20 +909,53 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         headsPanel.rebuild(heads: heads,
                            onSelect: { [weak self] head in self?.openThread(head) },
                            onRemove: { [weak self] head in self?.removeHead(head) })
+        // Nạp avatar bất đồng bộ cho từng head (có cache, lần sau mở là có ngay)
+        for head in heads {
+            guard let url = head.avatarURL,
+                  let hv = headsPanel.headView(forThreadID: head.threadID) else { continue }
+            AvatarLoader.shared.load(urlString: url, key: head.threadID) { img in
+                hv.avatarImage = img
+            }
+        }
     }
 
     /// Mở THẲNG 1 đoạn chat bằng deep link /t/<id> — không qua inbox chung.
+    /// Bấm lại head đang mở → đóng thẻ (toggle). Thẻ tự đặt cạnh head vừa bấm,
+    /// đuôi tam giác chỉ đúng vào head đó (giống ảnh mẫu).
     private func openThread(_ head: ChatHead) {
+        if chat.isVisible, openThreadID == head.threadID {
+            chat.orderOut(nil)
+            openThreadID = nil
+            return
+        }
+        openThreadID = head.threadID
         chat.webView.load(URLRequest(url: Mini.threadURL(head.threadID)))
-        chat.title = "Messenger — \(head.name)"
+        let y = headsPanel.screenYCenter(forThreadID: head.threadID)
+            ?? headsPanel.frame.midY
+        placeCard(nearScreenY: y)
         showChatWindow()
     }
 
     /// Về lại inbox chung (danh sách tất cả đoạn chat).
     private func openInbox() {
+        openThreadID = nil
         chat.webView.load(URLRequest(url: Mini.chatURL))
-        chat.title = "Messenger"
+        placeCard(nearScreenY: headsPanel.frame.midY)
         showChatWindow()
+    }
+
+    /// Đặt thẻ chat sát mép trái dải heads, ngang tầm head vừa bấm,
+    /// đuôi tam giác chỉ đúng vào head đó.
+    private func placeCard(nearScreenY screenY: CGFloat) {
+        let size = ChatWindow.cardSize
+        guard let screen = headsPanel.screen ?? NSScreen.main else { return }
+        let vf = screen.visibleFrame
+        var x = headsPanel.frame.minX - size.width - 14
+        x = max(x, vf.minX + 8)
+        var y = screenY - size.height / 2
+        y = min(max(y, vf.minY + 8), vf.maxY - size.height - 8)
+        chat.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: true)
+        chat.moveTail(toLocalY: screenY - y)
     }
 
     private func showChatWindow() {
@@ -806,7 +1014,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     /// cách "sạch" hơn là observe DOM, nhưng phức tạp hơn nhiều.
     private func scanInbox() {
         chat.webView.load(URLRequest(url: Mini.chatURL))
-        chat.title = "Messenger"
         showChatWindow()
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             self?.chat.webView.evaluateJavaScript(MiniJS.threadList,
@@ -857,7 +1064,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let idx = popup.indexOfSelectedItem
         guard fresh.indices.contains(idx) else { return }
         let t = fresh[idx]
-        heads.append(ChatHead(name: t.name, threadID: t.id))
+        heads.append(ChatHead(name: t.name, threadID: t.id,
+                              avatarURL: t.avatar.isEmpty ? nil : t.avatar))
         saveHeads()
         rebuildHeads()
     }
@@ -871,22 +1079,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         webView.evaluateJavaScript(MiniJS.hideSidebar, completionHandler: nil)
     }
 
-    /// Lần đầu chưa có frame lưu: đặt cửa sổ chat bên trái bong bóng.
-    private func positionChatDefaultIfNeeded() {
-        guard UserDefaults.standard.string(forKey: Mini.chatFrameKey) == nil,
-              let vf = NSScreen.main?.visibleFrame else { return }
-        let bf = bubble.frame
-        let cs = chat.frame.size
-        var x = bf.minX - cs.width - 12
-        var y = bf.minY
-        x = min(max(x, vf.minX + 12), vf.maxX - cs.width - 12)
-        y = min(max(y, vf.minY + 12), vf.maxY - cs.height - 12)
-        chat.setFrameOrigin(NSPoint(x: x, y: y))
-    }
-
-    /// Nút đỏ: ẩn cửa sổ thay vì đóng hẳn (bong bóng vẫn còn để mở lại).
+    /// Ẩn thẻ thay vì đóng hẳn (bong bóng/heads vẫn còn để mở lại).
+    /// (Thẻ borderless không có nút đỏ, nhưng giữ lại cho an toàn.)
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
+        openThreadID = nil
         return false
     }
 
