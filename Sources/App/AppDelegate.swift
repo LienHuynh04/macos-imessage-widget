@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingPanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        print("[iMessageMini][DEBUG] applicationDidFinishLaunching")
         NSApp.setActivationPolicy(.accessory)
         installMenu()
 

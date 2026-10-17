@@ -79,22 +79,26 @@ final class FloatingPanel: NSPanel {
             onVoiceCall: {},
             onVideoCall: {}
         )
+        // Container bo góc: KHÔNG chạm trực tiếp vào layer của NSHostingView,
+        // vì can thiệp layer của hosting view có thể khiến SwiftUI không render.
+        let container = NSView(frame: NSRect(origin: .zero, size: DesignTokens.Window.defaultSize))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = DesignTokens.Window.cornerRadius
+        container.layer?.masksToBounds = true
+
         let hostingView = NSHostingView(rootView: RootView(
             store: conversationStore,
             config: MockData.headerConfig,
             actions: actions
         ))
         // NSHostingView(rootView:) tạo view với frame zero — phải set frame
-        // rõ ràng theo kích thước window, nếu không nội dung SwiftUI không hiện
-        // (window nền trong suốt nên sẽ tàng hình hoàn toàn dù app vẫn chạy).
-        hostingView.frame = NSRect(origin: .zero, size: DesignTokens.Window.defaultSize)
+        // rõ ràng, nếu không nội dung SwiftUI không hiện.
+        hostingView.frame = container.bounds
         hostingView.autoresizingMask = [.width, .height]
-        contentView = hostingView
+        container.addSubview(hostingView)
+        contentView = container
 
-        // Bo góc 20pt + cắt nội dung theo góc bo.
-        contentView?.wantsLayer = true
-        contentView?.layer?.cornerRadius = DesignTokens.Window.cornerRadius
-        contentView?.layer?.masksToBounds = true
+        print("[iMessageMini][DEBUG] FloatingPanel init — frame: \(frame)")
 
         center()
 
@@ -119,10 +123,12 @@ final class FloatingPanel: NSPanel {
 
     /// Hiện panel. Đã hiện thì đưa ra trước. Không active app, không cướp focus.
     func showPanel() {
+        print("[iMessageMini][DEBUG] showPanel — before: isVisible=\(isVisible), frame=\(frame)")
         ensureVisibleOnScreen()
         // orderFrontRegardless (thay vì makeKeyAndOrderFront) để giữ đúng
         // ngữ nghĩa non-activating của panel phụ trợ.
         orderFrontRegardless()
+        print("[iMessageMini][DEBUG] showPanel — after: isVisible=\(isVisible), frame=\(frame)")
     }
 
     // MARK: - Thu nhỏ thành bong bóng / mở lại
