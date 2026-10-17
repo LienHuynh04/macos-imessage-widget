@@ -256,6 +256,32 @@ final class AvatarView: NSView {
     }
 }
 
+// MARK: - Deterministic window backgrounds (do not rely on vibrancy materials)
+
+/// Dark translucent rounded bar for the avatar panel (matches the target UI).
+final class PanelBackgroundView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds, xRadius: 20, yRadius: 20)
+        NSColor(white: 0.16, alpha: 0.84).setFill()
+        path.fill()
+        NSColor(white: 1.0, alpha: 0.14).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
+    }
+}
+
+/// Light rounded background for the chat window.
+final class ChatBackgroundView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16)
+        NSColor(white: 1.0, alpha: 0.97).setFill()
+        path.fill()
+        NSColor.separatorColor.setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
+    }
+}
+
 // MARK: - Drag handle (pill) for moving the panel
 
 final class DragView: NSView {
@@ -303,15 +329,7 @@ final class PanelController: NSObject {
         window.hasShadow = false
         window.collectionBehavior = [.canJoinAllSpaces, .stationary]
 
-        let bg = NSVisualEffectView(frame: window.contentView!.bounds)
-        bg.material = .hudWindow
-        bg.blendingMode = .behindWindow
-        bg.state = .active
-        bg.wantsLayer = true
-        bg.layer?.cornerRadius = 20
-        bg.layer?.masksToBounds = true
-        bg.layer?.borderColor = NSColor.separatorColor.cgColor
-        bg.layer?.borderWidth = 0.5
+        let bg = PanelBackgroundView(frame: window.contentView!.bounds)
         bg.autoresizingMask = [.width, .height]
         window.contentView = bg
 
@@ -583,15 +601,7 @@ final class ChatWindowController: NSObject {
         window.hasShadow = false
         window.collectionBehavior = [.canJoinAllSpaces, .stationary]
 
-        let bg = NSVisualEffectView(frame: window.contentView!.bounds)
-        bg.material = .popover
-        bg.blendingMode = .behindWindow
-        bg.state = .active
-        bg.wantsLayer = true
-        bg.layer?.cornerRadius = 16
-        bg.layer?.masksToBounds = true
-        bg.layer?.borderColor = NSColor.separatorColor.cgColor
-        bg.layer?.borderWidth = 0.5
+        let bg = ChatBackgroundView(frame: window.contentView!.bounds)
         bg.autoresizingMask = [.width, .height]
         window.contentView = bg
 
@@ -861,8 +871,11 @@ final class PreviewBubble: NSView {
         label.lineBreakMode = .byWordWrapping
         label.isBordered = false
         label.backgroundColor = .clear
-        let singleW = ceil((text as NSString).size(withAttributes: [.font: font]).width)
-        let w = min(singleW, maxTextWidth)
+        // Measure with AppKit's own layout (handles diacritics correctly),
+        // then clamp to a single line when it fits.
+        label.preferredMaxLayoutWidth = 1000
+        let naturalW = ceil(label.intrinsicContentSize.width)
+        let w = min(naturalW, maxTextWidth)
         label.preferredMaxLayoutWidth = w
         let h = ceil(label.intrinsicContentSize.height)
         contentSize = NSSize(width: w + hPad * 2 + tailWidth, height: h + vPad * 2)
