@@ -1,89 +1,86 @@
-# Messenger Mini — macOS chat heads
+# Messenger Bubble — bản DIY (tự học, tự sửa)
 
-A tiny, free macOS floating chat-heads panel for Facebook Messenger, inspired by
-the classic Messenger chat heads. No third-party dependencies, no network access
-from the app itself, no account login.
+App macOS "bong bóng chat nổi" cho **Messenger thật**, viết bằng Swift thuần
+(AppKit + WebKit), **1 file duy nhất** `Sources/main.swift`, có chú thích
+tiếng Việt từng phần để bạn đọc-hiểu-tự sửa.
 
-What it does:
-- Shows a **vertical floating panel** on the right edge of the screen with your
-  configured conversations as circular avatars (with unread badges).
-- **Click an avatar** → a floating **chat window** opens next to the panel with
-  that conversation's messages, like the screenshot. Click again to close it.
-- Chats with unread messages show a small **preview bubble** next to their
-  avatar (click it to open the chat).
-- Drag the panel by its top handle to move it; its position is remembered.
-- The **"..."** menu lets you collapse/expand the panel, reload the config,
-  open the config folder, or quit.
+![concept](https://img.shields.io/badge/macOS-15%2B-blue) ![lang](https://img.shields.io/badge/Swift-AppKit%20%2B%20WebKit-orange)
 
-What it does NOT do (yet):
-- Message content is **static**, read from your config file. There is no live
-  Messenger sync — that needs inbox access, which is not wired up.
-- The app never sends messages. Anything that needs the real Messenger
-  (replying, calling, the input box) **opens the conversation on
-  messenger.com** in your default browser, where you are already logged in.
+## App làm được gì
 
-## Requirements
-- macOS Tahoe 26 (also likely to work on recent macOS versions)
-- Xcode Command Line Tools or Xcode
+- 🔵 **Bong bóng tròn nổi** luôn nằm trên mọi app (kể cả app fullscreen),
+  kéo thả tự do, nhớ vị trí sau khi tắt.
+- 💬 Bấm bong bóng → mở/đóng **cửa sổ chat mini** (mở `messenger.com` thật).
+- 🔴 **Badge đỏ** hiện số tin chưa đọc (đọc từ tiêu đề trang web).
+- 📌 Chuột phải → **"Ghim cửa sổ chat luôn nằm trên"** (bật/tắt always-on-top).
+- 🎨 Chuột phải → **"Đổi màu bong bóng"** (xoay vòng 4 màu, app nhớ lựa chọn).
+- 🔒 Tự đăng nhập Facebook 1 lần trong app; macOS nhớ cookie, lần sau khỏi nhập.
+- 🚪 Chuột phải → đăng xuất / thoát. Nút đỏ chỉ *ẩn* cửa sổ chat, không tắt app.
+- Không icon Dock (app phụ), thoát bằng menu chuột phải → *Thoát* hoặc `Cmd+Q`.
 
-## Build & run
-1. Open Terminal and move into this folder.
-2. Run:
-   `chmod +x build.sh`
-   `./build.sh`
-3. The app is created at `dist/Messenger Mini.app` and launched automatically.
-   (If macOS warns because it is an unsigned local app, use Control-click >
-   Open on `dist/Messenger Mini.app` in Finder and confirm, only if you built
-   it yourself from this source.)
-4. On first launch the app creates `~/.messenger-mini/chats.json` with sample
-   conversations. Edit that file to add your own chats — the panel reloads
-   automatically when you save (if auto-reload ever stops, use "..." > "Tải lại
-   cấu hình").
+## Chạy thử (trên Mac)
 
-The build script uses Apple's local `swiftc` compiler. It does not disable
-Gatekeeper or change system security settings.
-
-## Configuring your chats (`~/.messenger-mini/chats.json`)
-
-```json
-{
-  "chats": [
-    {
-      "name": "Mèo Cam",
-      "avatar": "/Users/ban/Pictures/meo-cam.png",
-      "url": "https://www.messenger.com/t/123456789",
-      "unread": 2,
-      "preview": "Chà",
-      "messages": [
-        { "from": "them", "text": "Chà" },
-        { "from": "me", "text": "Quá ngon luôn ấy chứ" }
-      ]
-    }
-  ]
-}
+```bash
+chmod +x build.sh   # chỉ làm 1 lần
+./build.sh          # mỗi lần sửa code xong chạy lại lệnh này
 ```
 
-- `name`: shown under the avatar tooltip and in the chat window header.
-- `avatar`: a local image path (`~/...` works) or an `https://` URL. Empty
-  string (or omitted) falls back to a circle with the first letter of the name.
-- `url`: the conversation's link. Open the chat on messenger.com in your
-  browser and copy the URL — it looks like `https://www.messenger.com/t/…`.
-  Clicking the avatar, the header, or pressing Enter in the input box opens
-  this URL.
-- `unread`: red badge count on the avatar (0 hides it).
-- `preview`: small subtitle under the name in the chat window header. If `unread`
-  is greater than 0, it is also shown in the popup bubble next to the avatar.
-- `messages`: static messages shown in the chat window. `"from"` is `"them"`
-  (grey bubble, left) or `"me"` (blue bubble, right). Optional `"seen": true`
-  shows blue seen checkmarks under your bubble; optional `"reaction": "😃"`
-  shows an emoji reaction under the bubble.
+Yêu cầu: macOS 15 trở lên + Xcode (khuyên dùng) hoặc Command Line Tools
+(`xcode-select --install`). **Lần đầu mở**, macOS có thể hỏi "mở app từ nhà
+phát triển không xác định?" → vào *System Settings → Privacy & Security* bấm
+**Open Anyway** (app do chính bạn build, ký ad-hoc local — an toàn).
 
-## Quit
-The app has no Dock icon. Use "..." > "Thoát" in the panel, or from Terminal:
-`pkill -x 'Messenger Mini'`
+Đăng nhập Facebook **ngay trong cửa sổ chat của app**, 1 lần duy nhất.
 
-## Notes and limitations
-- The panel and chat windows use a floating window level and stay above
-  ordinary windows. macOS can restrict floating windows in some full-screen,
-  secure, or system-controlled contexts.
-- To change the avatar size, edit the `diameter:` values in `Sources/main.swift`.
+## Code được tổ chức thế nào
+
+`Sources/main.swift` đọc từ trên xuống, 8 phần — mỗi phần là 1 bài học:
+
+| Phần | Nội dung | Bài học |
+|------|----------|---------|
+| 1 | Hằng số (`Mini`) | Mọi thứ chỉnh nhanh: màu, kích thước, URL |
+| 2 | JavaScript inject (`MiniJS`) | Cầu nối Web ↔ Native: đọc `document.title` |
+| 3 | `UnreadScriptHandler` | Mẫu **weak wrapper** — tránh retain cycle với WebKit |
+| 4 | `BubbleView` | Vẽ tay bằng `draw(_:)`, phân biệt kéo/bấm, menu chuột phải |
+| 5 | `BubbleWindow` | **Công thức floating window**: `.borderless` + `.floating` + `canJoinAllSpaces` |
+| 6 | `ChatWindow` | WKWebView + cookie persistent + nút đỏ chỉ ẩn cửa sổ |
+| 7 | `AppDelegate` | Nối sự kiện bằng closure, nhớ dùng `[weak self]` |
+| 8 | `main` (4 dòng) | Vì sao delegate phải là biến top-level |
+
+## Bài tập tự làm (từ dễ → khó)
+
+1. **Đổi màu mặc định**: thêm 1 màu vào `Mini.bubbleColors` (copy 1 dòng).
+2. **Bong bóng to hơn**: đổi `bubbleDiameter` thành `80`, build lại xem.
+3. **Đổi trang web**: sửa `chatURL` thành `https://www.facebook.com` — bạn sẽ
+   thấy app này thật ra là "trình duyệt mini" cho bất kỳ trang nào.
+4. **Thêm mục menu**: copy mẫu `menu.addItem(...)` trong `rightMouseDown`
+   để thêm "Mở Facebook" chẳng hạn.
+5. **Badge nhấp nháy**: trong `draw(_:)`, thử vẽ badge với alpha thay đổi
+   theo thời gian (gợi ý: `Timer` + `needsDisplay = true`).
+6. **Đọc thêm từ trang web**: viết thêm JS trong `MiniJS` để đọc tên người
+   đang nhắn (gợi ý: `document.querySelector(...)`), gửi về Swift như `unread`.
+
+## Giới hạn cần biết (nói thật)
+
+- Đây là **web Messenger trong app của bạn**, không phải API chính thức của
+  Meta. Nếu Meta đổi cấu trúc trang/tiêu đề, badge có thể đọc sai — cửa sổ
+  chat vẫn dùng bình thường.
+- Muốn phát hành lên App Store: iMessage/Messenger không có API đọc tin nhắn;
+  cách bọc web này Apple thường không duyệt cho App Store (dùng cá nhân thì
+  thoải mái).
+- **PiP (Picture-in-Picture) thật** trên macOS là API của `AVKit` dành cho
+  *video* — không áp dụng cho cửa sổ chat. Cái bạn cần cho chat chính là
+  "always-on-top window", app này đã có (mục *Ghim cửa sổ chat luôn nằm trên*).
+
+## Cấu trúc thư mục
+
+```
+messenger-bubble-diy/
+├── Sources/main.swift      # toàn bộ app, 1 file, chú thích tiếng Việt
+├── Resources/Info.plist    # thông tin bundle macOS
+├── build.sh                # biên dịch + đóng gói thành .app
+└── README.md               # file này
+```
+
+---
+*Dự án cá nhân tự học — build bằng `./build.sh` trên Mac của bạn.*
