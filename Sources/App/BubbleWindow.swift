@@ -43,6 +43,12 @@ final class BubbleWindow: NSPanel {
             onDragChanged: { [weak self] translation in self?.dragChanged(translation) },
             onDragEnded: { [weak self] in self?.dragEnded() }
         ))
+        // Như FloatingPanel: NSHostingView(rootView:) có frame zero —
+        // set rõ ràng theo kích thước bubble để nội dung hiện được.
+        hostingView.frame = NSRect(
+            x: 0, y: 0,
+            width: DesignTokens.Bubble.diameter, height: DesignTokens.Bubble.diameter
+        )
         hostingView.autoresizingMask = [.width, .height]
         contentView = hostingView
     }

@@ -84,6 +84,10 @@ final class FloatingPanel: NSPanel {
             config: MockData.headerConfig,
             actions: actions
         ))
+        // NSHostingView(rootView:) tạo view với frame zero — phải set frame
+        // rõ ràng theo kích thước window, nếu không nội dung SwiftUI không hiện
+        // (window nền trong suốt nên sẽ tàng hình hoàn toàn dù app vẫn chạy).
+        hostingView.frame = NSRect(origin: .zero, size: DesignTokens.Window.defaultSize)
         hostingView.autoresizingMask = [.width, .height]
         contentView = hostingView
 
