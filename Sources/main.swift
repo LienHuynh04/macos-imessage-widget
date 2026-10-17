@@ -1044,6 +1044,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             alert.runModal()
             return
         }
+        // Tiện thể: bổ sung avatar cho các head đã ghim từ trước mà chưa có ảnh
+        var upgraded = false
+        for t in list {
+            if let i = heads.firstIndex(where: { $0.threadID == t.id }),
+               heads[i].avatarURL == nil, !t.avatar.isEmpty {
+                heads[i].avatarURL = t.avatar
+                upgraded = true
+            }
+        }
+        if upgraded { saveHeads() }
         // Lọc bớt những thread đã ghim rồi cho gọn
         let fresh = list.filter { t in !heads.contains(where: { $0.threadID == t.id }) }
         guard !fresh.isEmpty else {
